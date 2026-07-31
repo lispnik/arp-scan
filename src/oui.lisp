@@ -8,6 +8,8 @@
 ;;; oui.txt entries have the shape:
 ;;;   "28-6F-B9   (hex)\t\tNokia Shanghai Bell Co., Ltd."
 ;;; We key by the 24-bit prefix as an EQL-hashable integer.
+;;;
+;;; I forget where I found it.
 
 (defun hex-digit (c)
   (or (digit-char-p c 16)
