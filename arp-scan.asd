@@ -3,16 +3,23 @@
   :author "Matthew Kennedy <burnsidemk@gmail.com>"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("cffi" "alexandria" "clingon" "version-string")
+  :depends-on ("cffi" "alexandria" "clingon" "version-string" "bordeaux-threads")
   :serial t
   :components ((:module "data"
-                :components ((:static-file "oui.txt")))
+                :components ((:static-file "oui.txt")
+                             (:static-file "mam.txt")
+                             (:static-file "oui36.txt")))
                (:module "src"
                 :components ((:file "package")
                              (:file "libpcap")
+                             (:file "capture")
                              (:file "interface")
                              (:file "arp")
                              (:file "oui")
+                             (:file "observer")
+                             (:file "output")
+                             (:file "baseline")
+                             (:file "fingerprint")
                              (:file "scanner")
                              (:file "main"))))
   :build-operation "program-op"

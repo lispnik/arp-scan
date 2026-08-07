@@ -45,16 +45,70 @@
     (copy-into frame 38 target-ip)      ; tpa
     frame))
 
+(defconstant +arp-payload-end+ 42
+  "Offset just past the ARP payload; anything beyond is Ethernet padding.")
+
+(defun subvector (frame start length)
+  (let ((out (make-array length :element-type '(unsigned-byte 8))))
+    (loop for i from 0 below length
+          do (setf (aref out i) (aref frame (+ start i))))
+    out))
+
+(defun parse-arp (frame)
+  "Parse any ARP frame, request or reply.
+
+Returns (values op spa sha tpa tha padding), or NIL if FRAME is not ARP.
+PADDING is the Ethernet filler past the 42-byte ARP payload, or NIL when the
+capture was too short to include any. Callers get the padding because the
+sending stack chooses it and some devices leak buffer contents there."
+  (when (and (>= (length frame) +arp-payload-end+)
+             (= (get-u16-be frame 12) +ethertype-arp+))
+    (values (get-u16-be frame 20)             ; op
+            (subvector frame 28 4)            ; spa: sender protocol address
+            (subvector frame 22 6)            ; sha: sender hardware address
+            (subvector frame 38 4)            ; tpa: target protocol address
+            (subvector frame 32 6)            ; tha: target hardware address
+            (when (> (length frame) +arp-payload-end+)
+              (subvector frame +arp-payload-end+
+                         (- (length frame) +arp-payload-end+))))))
+
 (defun parse-arp-reply (frame)
   "If FRAME is an ARP reply, return (values sender-ip sender-mac), else NIL."
-  (when (and (>= (length frame) 42)
-             (= (get-u16-be frame 12) +ethertype-arp+)
-             (= (get-u16-be frame 20) +arp-op-reply+))
-    (let ((sha (make-array 6 :element-type '(unsigned-byte 8)))
-          (spa (make-array 4 :element-type '(unsigned-byte 8))))
-      (loop for i from 0 below 6 do (setf (aref sha i) (aref frame (+ 22 i))))
-      (loop for i from 0 below 4 do (setf (aref spa i) (aref frame (+ 28 i))))
+  (multiple-value-bind (op spa sha) (parse-arp frame)
+    (when (and op (= op +arp-op-reply+))
       (values spa sha))))
+
+;;; MAC address semantics
+;;;
+;;; The two low bits of the first octet carry meaning, and both matter to us:
+;;;
+;;;   bit 0 (0x01) -- group/multicast. Legal as a *destination*, never as a
+;;;                   source: no real NIC owns a multicast address, so a frame
+;;;                   claiming one is malformed or forged.
+;;;   bit 1 (0x02) -- locally administered. The address was assigned by software
+;;;                   rather than burned in by a manufacturer, which today
+;;;                   usually means privacy randomization -- iOS and Android
+;;;                   rotate one per SSID. There is no vendor to look up, and
+;;;                   printing an empty vendor column implies we failed rather
+;;;                   than that the question has no answer.
+
+(defun mac->u48 (mac)
+  (loop with n = 0
+        for b across mac
+        do (setf n (logior (ash n 8) b))
+        finally (return n)))
+
+(defun multicast-mac-p (mac)
+  (logbitp 0 (aref mac 0)))
+
+(defun locally-administered-p (mac)
+  (logbitp 1 (aref mac 0)))
+
+(defun mac-kind (mac)
+  "One of :global, :randomized, or :multicast."
+  (cond ((multicast-mac-p mac) :multicast)
+        ((locally-administered-p mac) :randomized)
+        (t :global)))
 
 ;;; IP / CIDR helpers
 

@@ -3,6 +3,7 @@ babel, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c
 babel-streams, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-streams.asd
 babel-tests, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-tests.asd
 bobbin, ghcr.io/ocicl/bobbin@sha256:7368d88e9f1d8a94b9bddf5e1887e384ef738235570142dd1cfe98c90077cc13, bobbin-20240503-b454e82/bobbin.asd
+bordeaux-threads, ghcr.io/ocicl/bordeaux-threads@sha256:bbb32afe3987e102149cc019f4f7366a05f7a37d1503f5f86a27745e671c320a, bordeaux-threads-0.9.4/bordeaux-threads.asd
 cffi, ghcr.io/ocicl/cffi@sha256:bad27a737249639c0555693cdd4d6c8845f88e0b0cea6f59bf811e6c2e4a01e9, cffi-20260516-face457/cffi.asd
 cffi-examples, ghcr.io/ocicl/cffi@sha256:bad27a737249639c0555693cdd4d6c8845f88e0b0cea6f59bf811e6c2e4a01e9, cffi-20260516-face457/cffi-examples.asd
 cffi-grovel, ghcr.io/ocicl/cffi@sha256:bad27a737249639c0555693cdd4d6c8845f88e0b0cea6f59bf811e6c2e4a01e9, cffi-20260516-face457/cffi-grovel.asd
@@ -16,9 +17,12 @@ clingon, ghcr.io/ocicl/clingon@sha256:519c73567f308b0eac75a4a4ba468a8b433184aa34
 clingon.demo, ghcr.io/ocicl/clingon@sha256:519c73567f308b0eac75a4a4ba468a8b433184aa344eac2b79b8ab9f44b9db3c, clingon-20260429-94d4e2f/clingon.demo.asd
 clingon.intro, ghcr.io/ocicl/clingon@sha256:519c73567f308b0eac75a4a4ba468a8b433184aa344eac2b79b8ab9f44b9db3c, clingon-20260429-94d4e2f/clingon.intro.asd
 clingon.test, ghcr.io/ocicl/clingon@sha256:519c73567f308b0eac75a4a4ba468a8b433184aa344eac2b79b8ab9f44b9db3c, clingon-20260429-94d4e2f/clingon.test.asd
+global-vars, ghcr.io/ocicl/global-vars@sha256:d197e871c9c9abc4bf31b1186f5fd28f0ca848ebe2e9dddf2d82ecee01dbdc65, global-vars-20240503-c749f32/global-vars.asd
+global-vars-test, ghcr.io/ocicl/global-vars@sha256:d197e871c9c9abc4bf31b1186f5fd28f0ca848ebe2e9dddf2d82ecee01dbdc65, global-vars-20240503-c749f32/global-vars-test.asd
 split-sequence, ghcr.io/ocicl/split-sequence@sha256:3a37662eedd99c42995587b9d443c4631f25c4c523091bcca31a27b880585b8e, split-sequence-2.0.1/split-sequence.asd
 trivial-features, ghcr.io/ocicl/trivial-features@sha256:e278e24d39060fc7d3715531b16ddd9ab7f93f22ade53e436c0b86dbae3aa065, trivial-features-1.0/trivial-features.asd
 trivial-features-tests, ghcr.io/ocicl/trivial-features@sha256:e278e24d39060fc7d3715531b16ddd9ab7f93f22ade53e436c0b86dbae3aa065, trivial-features-1.0/trivial-features-tests.asd
+trivial-garbage, ghcr.io/ocicl/trivial-garbage@sha256:a85dcf4110ad60ae9f6c70970acceb2bf12402ce5326891643d35506059afb1d, trivial-garbage-20240503-3474f64/trivial-garbage.asd
 uffi, ghcr.io/ocicl/cffi@sha256:bad27a737249639c0555693cdd4d6c8845f88e0b0cea6f59bf811e6c2e4a01e9, cffi-20260516-face457/uffi-compat/uffi.asd
 version-string, ghcr.io/ocicl/version-string@sha256:eb8f45786af7fd6f792aecada1f905870f1d79abfaee0ceb774a94824ad9b14f, cl-version-string-20251228-668f2fa/version-string.asd
 with-user-abort, ghcr.io/ocicl/with-user-abort@sha256:c19560034f9909a7afb4110b5efd939a9f1e829d9ef9887797b98679f290c480, with-user-abort-20240503-a3db02e/with-user-abort.asd
