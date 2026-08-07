@@ -1,0 +1,6 @@
+# The IEEE registry files ship with CRLF line endings. Treat them as opaque so
+# git stops offering to normalize them -- a conversion would rewrite all three
+# in full and bury real changes under a 90,000-line diff.
+data/oui.txt   -text
+data/mam.txt   -text
+data/oui36.txt -text
