@@ -44,22 +44,29 @@ further SECONDS."
     ;; sitting in the queue.
     (observe-frames obs (capture-drain cap))))
 
-(defun send-pass (handle cap obs src-mac src-ip targets per-host-delay-us)
-  "Send an ARP request to every u32 in TARGETS, draining as we go.
+(defun send-pass (handle cap obs src-mac src-ip first last per-host-delay-us
+                  &key skip-answered)
+  "Send an ARP request across the range FIRST..LAST, draining as we go.
+Returns how many were sent. With SKIP-ANSWERED, addresses that already replied
+are passed over, which is what makes each retry cheaper than the last.
+
+The range is walked rather than listed. Materializing it cost one cons per
+address before a single packet went out -- fine for a /24, 16 million for a /8,
+and the mechanism by which a bad prefix used to exhaust the heap.
 
 The send stamp is taken immediately after the frame is handed to libpcap, on the
 same monotonic clock the capture thread stamps arrivals with, so the difference
 is a real round trip rather than a comparison across two clock domains."
-  (loop for u32 in targets
-        do (pcap-sendpacket handle (build-arp-request src-mac src-ip (u32->ip u32)))
-           (note-send obs u32 (capture-now))
-           (observe-frames obs (capture-drain cap))
-           (when (plusp per-host-delay-us)
-             (sleep (/ per-host-delay-us 1.0d6)))))
-
-(defun pending-targets (obs targets)
-  "Targets that have not answered yet."
-  (remove-if (lambda (u32) (observer-seen-p obs u32)) targets))
+  (let ((sent 0))
+    (loop for u32 from first to last
+          unless (and skip-answered (observer-seen-p obs u32))
+            do (pcap-sendpacket handle (build-arp-request src-mac src-ip (u32->ip u32)))
+               (note-send obs u32 (capture-now))
+               (observe-frames obs (capture-drain cap))
+               (incf sent)
+               (when (plusp per-host-delay-us)
+                 (sleep (/ per-host-delay-us 1.0d6))))
+    sent))
 
 (defun make-scan-observer (format padding anomalies-only)
   "An observer wired for streaming output under text format; silent otherwise,
@@ -101,35 +108,39 @@ stdout has to stay machine-readable."
                                                 :snaplen 96 :promisc nil :timeout-ms 50))
               (multiple-value-bind (first last)
                   (if cidr (cidr-range cidr) (subnet-range-from-iface iface))
-                (let ((targets (loop for u32 from first to last collect u32)))
-                  ;; Report only what was asked for. Ambient ARP chatter from
-                  ;; outside the range is still captured -- it just is not ours
-                  ;; to report here. Use --passive for that.
-                  (setf (observer-scope obs) (cons first last))
-                  (format progress "Scanning ~A - ~A on ~A (~A, ~A)~%"
-                          (format-ip (u32->ip first)) (format-ip (u32->ip last))
-                          (iface-name iface) (format-ip src-ip) (format-mac src-mac))
-                  (when header-p
-                    (format progress *text-row-fmt* "IP" "MAC" "Vendor"))
-                  (force-output progress)
-                  (send-pass send-handle cap obs src-mac src-ip targets per-host-delay-us)
-                  (pump cap obs wait-seconds)
-                  ;; Retries cover only the silent addresses, so each pass is
-                  ;; cheaper than the one before it.
-                  (loop repeat retry
-                        for pending = (pending-targets obs targets)
-                        while pending
-                        do (send-pass send-handle cap obs src-mac src-ip pending
-                                      per-host-delay-us)
-                           (pump cap obs wait-seconds))
-                  ;; Fingerprinting probes hosts we have already found, so it
-                  ;; runs last and only over what actually answered.
-                  (when fingerprint
-                    (let ((found (observer-host-list obs)))
-                      (format progress "~&Fingerprinting ~D host~:P, ~D probes each...~%"
-                              (length found) (length *probes*))
-                      (force-output progress)
-                      (fingerprint-hosts send-handle cap iface found)))))))
+                ;; Report only what was asked for. Ambient ARP chatter from
+                ;; outside the range is still captured -- it just is not ours
+                ;; to report here. Use --passive for that.
+                (setf (observer-scope obs) (cons first last))
+                (format progress "Scanning ~A - ~A on ~A (~A, ~A)~%"
+                        (format-ip (u32->ip first)) (format-ip (u32->ip last))
+                        (iface-name iface) (format-ip src-ip) (format-mac src-mac))
+                (when header-p
+                  (format progress *text-row-fmt* "IP" "MAC" "Vendor"))
+                (force-output progress)
+                (send-pass send-handle cap obs src-mac src-ip first last
+                           per-host-delay-us)
+                (pump cap obs wait-seconds)
+                ;; Retries cover only the silent addresses, so each pass is
+                ;; cheaper than the one before it. Stop early once a pass has
+                ;; nothing left to ask.
+                (loop repeat retry
+                      while (plusp (send-pass send-handle cap obs src-mac src-ip
+                                              first last per-host-delay-us
+                                              :skip-answered t))
+                      do (pump cap obs wait-seconds))
+                ;; Fingerprinting probes hosts we have already found, so it
+                ;; runs last and only over what actually answered.
+                (when fingerprint
+                  (let ((found (observer-host-list obs)))
+                    (format progress "~&Fingerprinting ~D host~:P, ~D probes each...~%"
+                            (length found) (length *probes*))
+                    (force-output progress)
+                    ;; Drop the outstanding send times: a probe reply arriving
+                    ;; seconds later would otherwise be matched against the
+                    ;; original scan's request and recorded as a huge RTT.
+                    (clrhash (observer-send-times obs))
+                    (fingerprint-hosts send-handle cap obs iface found))))))
            (when (plusp (capture-dropped cap))
              (format progress "~&Note: dropped ~D queued frame~:P; the network is busier than the queue is deep.~%"
                      (capture-dropped cap)))
@@ -236,9 +247,14 @@ broadcast stream with no components, which is the portable bit bucket."
 
 (defun scan (&key interface cidr (per-host-delay-us 1000) (wait-seconds 2)
                   (retry 2) passive watch (format :text) padding anomalies-only
-                  rtt fingerprint baseline ((:write-baseline baseline-out) nil)
-                  fail-on-anomaly)
-  "Scan a subnet for hosts via ARP and return an alist of (ip . mac).
+                  rtt fingerprint baseline ((:write-baseline baseline-out) nil))
+  "Scan a subnet for hosts via ARP.
+
+Returns (values alist status), where ALIST is (ip . mac) pairs and STATUS is a
+plist of :unknown and :anomalies counts. Deciding what a non-zero count means --
+in particular whether to exit non-zero -- belongs to the caller: this is library
+code, and a library that can terminate the process is a trap for anyone
+embedding it. MAIN owns --fail-on-anomaly.
 
 INTERFACE is a string like \"en0\"; defaults to the first usable interface.
 CIDR is a string like \"192.168.1.0/24\"; defaults to the interface's local subnet.
@@ -280,13 +296,10 @@ FAIL-ON-ANOMALY exits non-zero when anomalies or unknown hosts turn up."
             (when baseline-out
               (format (progress-stream format) "~&Wrote ~D host~:P to ~A~%"
                       (write-baseline baseline-out hosts) baseline-out))
-            (when (and fail-on-anomaly
-                       (or (plusp unknown) (observer-anomalies obs)))
-              (format *error-output* "~&~D unknown host~:P, ~D anomal~:@P~%"
-                      unknown (length (observer-anomalies obs)))
-              (uiop:quit 2))
-            (loop for host in hosts
-                  collect (cons (host-ip host) (host-mac host))))))))
+            (values (loop for host in hosts
+                          collect (cons (host-ip host) (host-mac host)))
+                    (list :unknown unknown
+                          :anomalies (length (observer-anomalies obs)))))))))
 
 (defun scan-cidr (cidr &rest args &key interface per-host-delay-us wait-seconds
                                        retry passive watch format padding anomalies-only)

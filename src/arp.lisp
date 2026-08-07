@@ -126,18 +126,43 @@ sending stack chooses it and some devices leak buffer contents there."
           (aref b 3) (ldb (byte 8 0)  n))
     b))
 
+(define-condition invalid-target (error)
+  ((text :initarg :text :reader invalid-target-text)
+   (reason :initarg :reason :reader invalid-target-reason))
+  (:report (lambda (c s)
+             (format s "Bad target ~S: ~A"
+                     (invalid-target-text c) (invalid-target-reason c))))
+  (:documentation
+   "Signalled for input a user typed, so MAIN can report it as a usage problem
+rather than letting a raw type error out of PARSE-INTEGER or AREF reach them."))
+
+(defun bad-target (text reason &rest args)
+  (error 'invalid-target :text text :reason (apply #'format nil reason args)))
+
 (defun parse-ip (s)
-  "Parse a dotted-quad string to a 4-byte vector."
-  (let ((bytes (make-array 4 :element-type '(unsigned-byte 8)))
-        (start 0)
-        (idx 0))
-    (dotimes (i (length s))
-      (when (char= (char s i) #\.)
-        (setf (aref bytes idx) (parse-integer s :start start :end i)
-              start (1+ i)
-              idx (1+ idx))))
-    (setf (aref bytes 3) (parse-integer s :start start))
-    bytes))
+  "Parse a dotted-quad string to a 4-byte vector.
+
+Validates rather than trusting: unchecked, \"999.1.1.0\" reaches AREF and dies
+with a type error about (UNSIGNED-BYTE 8), which tells the user nothing about
+what they typed."
+  (let ((octets '())
+        (start 0))
+    (dotimes (i (1+ (length s)))
+      (when (or (= i (length s)) (char= (char s i) #\.))
+        (when (= start i)
+          (bad-target s "empty octet"))
+        (let ((piece (subseq s start i)))
+          (unless (every #'digit-char-p piece)
+            (bad-target s "~S is not a number" piece))
+          (let ((v (parse-integer piece :junk-allowed t)))
+            (unless (and v (<= 0 v 255))
+              (bad-target s "octet ~A is out of range 0-255" piece))
+            (push v octets)))
+        (setf start (1+ i))))
+    (setf octets (nreverse octets))
+    (unless (= 4 (length octets))
+      (bad-target s "expected 4 octets, got ~D" (length octets)))
+    (make-array 4 :element-type '(unsigned-byte 8) :initial-contents octets)))
 
 (defun prefix->mask (prefix)
   (if (zerop prefix)
@@ -146,17 +171,28 @@ sending stack chooses it and some devices leak buffer contents there."
 
 (defun cidr-range (cidr)
   "Given e.g. \"192.168.1.0/24\", return (values first-u32 last-u32).
-Excludes network and broadcast for prefixes <= 30."
-  (let* ((slash (position #\/ cidr))
-         (ip-s (subseq cidr 0 slash))
-         (prefix (parse-integer cidr :start (1+ slash)))
-         (ip (ip->u32 (parse-ip ip-s)))
-         (mask (prefix->mask prefix))
-         (net (logand ip mask))
-         (bcast (logior net (logand #xffffffff (lognot mask)))))
-    (if (<= prefix 30)
-        (values (1+ net) (1- bcast))
-        (values net bcast))))
+Excludes network and broadcast for prefixes <= 30.
+
+The prefix bound is not decoration. Unchecked, /99 makes (ASH #xFFFFFFFF -67)
+zero, the mask vanishes, and the range becomes the whole of IPv4 -- which the
+caller then tries to walk, so a single mistyped digit turns into 4.3 billion
+addresses and an exhausted heap."
+  (let ((slash (position #\/ cidr)))
+    (unless slash
+      (bad-target cidr "expected a prefix, as in ~A/24" cidr))
+    (let ((prefix-s (subseq cidr (1+ slash))))
+      (unless (and (plusp (length prefix-s)) (every #'digit-char-p prefix-s))
+        (bad-target cidr "prefix ~S is not a number" prefix-s))
+      (let ((prefix (parse-integer prefix-s)))
+        (unless (<= 0 prefix 32)
+          (bad-target cidr "prefix /~D is out of range 0-32" prefix))
+        (let* ((ip (ip->u32 (parse-ip (subseq cidr 0 slash))))
+               (mask (prefix->mask prefix))
+               (net (logand ip mask))
+               (bcast (logior net (logand #xffffffff (lognot mask)))))
+          (if (<= prefix 30)
+              (values (1+ net) (1- bcast))
+              (values net bcast)))))))
 
 (defun subnet-range-from-iface (iface)
   "Return (values first-u32 last-u32) for the iface's local subnet."

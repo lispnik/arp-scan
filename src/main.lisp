@@ -41,26 +41,76 @@
    (clingon:make-option :flag    :short-name #\l :long-name "list"      :key :list
                         :description "List interfaces and exit")))
 
-(defun handler (cmd)
+(define-condition usage-error (error)
+  ((message :initarg :message :reader usage-error-message))
+  (:report (lambda (c s) (write-string (usage-error-message c) s))))
+
+(defun check-option-combination (cmd)
+  "Reject requests that cannot be honored as written.
+
+Both of these used to be accepted and then quietly ignored, which is the worst
+of the options available: the user gets output that looks like an answer to the
+question they asked."
+  (let ((format (parse-format (clingon:getopt cmd :format))))
+    (when (and (clingon:getopt cmd :passive) (clingon:getopt cmd :fingerprint))
+      (error 'usage-error :message
+             "--fingerprint has to transmit probes, which --passive forbids. Pick one."))
+    (when (and (clingon:getopt cmd :watch) (structured-format-p format))
+      (error 'usage-error :message
+             (format nil "--watch reports changes as they happen and cannot emit ~(~A~): a single document would never be closed off. Use --format text, or drop --watch."
+                     format)))
+    format))
+
+(defun dispatch (cmd)
   (cond
     ((clingon:getopt cmd :list)
      (list-interfaces))
     (t
-     (scan :interface         (clingon:getopt cmd :interface)
-           :cidr              (clingon:getopt cmd :cidr)
-           :wait-seconds      (clingon:getopt cmd :wait)
-           :per-host-delay-us (clingon:getopt cmd :delay)
-           :retry             (clingon:getopt cmd :retry)
-           :passive           (clingon:getopt cmd :passive)
-           :watch             (clingon:getopt cmd :watch)
-           :format            (parse-format (clingon:getopt cmd :format))
-           :padding           (clingon:getopt cmd :padding)
-           :anomalies-only    (clingon:getopt cmd :anomalies-only)
-           :rtt               (clingon:getopt cmd :rtt)
-           :fingerprint       (clingon:getopt cmd :fingerprint)
-           :baseline          (clingon:getopt cmd :baseline)
-           :write-baseline    (clingon:getopt cmd :write-baseline)
-           :fail-on-anomaly   (clingon:getopt cmd :fail-on-anomaly)))))
+     (let ((format (check-option-combination cmd)))
+       (multiple-value-bind (hosts status)
+           (scan :interface         (clingon:getopt cmd :interface)
+                 :cidr              (clingon:getopt cmd :cidr)
+                 :wait-seconds      (clingon:getopt cmd :wait)
+                 :per-host-delay-us (clingon:getopt cmd :delay)
+                 :retry             (clingon:getopt cmd :retry)
+                 :passive           (clingon:getopt cmd :passive)
+                 :watch             (clingon:getopt cmd :watch)
+                 :format            format
+                 :padding           (clingon:getopt cmd :padding)
+                 :anomalies-only    (clingon:getopt cmd :anomalies-only)
+                 :rtt               (clingon:getopt cmd :rtt)
+                 :fingerprint       (clingon:getopt cmd :fingerprint)
+                 :baseline          (clingon:getopt cmd :baseline)
+                 :write-baseline    (clingon:getopt cmd :write-baseline))
+         (declare (ignore hosts))
+         ;; The exit decision lives here, not in SCAN: turning a result into a
+         ;; process status is the command's job.
+         (when (clingon:getopt cmd :fail-on-anomaly)
+           (let ((unknown (getf status :unknown 0))
+                 (anomalies (getf status :anomalies 0)))
+             (when (or (plusp unknown) (plusp anomalies))
+               (format *error-output* "~&~D unknown host~:P, ~D anomal~:@P~%"
+                       unknown anomalies)
+               (uiop:quit 2)))))))))
+
+(defun handler (cmd)
+  "Run the command, reporting failures in terms the user can act on.
+
+The handling has to happen *here* rather than in MAIN. CLINGON:RUN wraps this
+call in its own HANDLER-CASE ending in a catch-all `error' clause, so anything
+signalled from here is caught, printed bare, and turned into an exit before it
+could ever reach a handler wrapped around CLINGON:RUN itself. The needs-root
+hint below sat unreachable for exactly that reason."
+  (handler-case (dispatch cmd)
+    ;; Bad input is a typo, not a malfunction. 64 is EX_USAGE, matching what
+    ;; clingon returns for its own argument errors.
+    ((or usage-error invalid-target) (e)
+      (format *error-output* "~&~A~%See 'arp-scan --help'.~%" e)
+      (uiop:quit 64))
+    (pcap-error (e)
+      (format *error-output* "~&~A~%~
+                              Hint: raw packet send/receive needs root. Try: sudo arp-scan~%" e)
+      (uiop:quit 1))))
 
 (defun make-app ()
   (clingon:make-command
@@ -85,11 +135,11 @@
 (defun main ()
   ;; Ctrl-C is the ordinary way to leave watch mode; clingon catches SIGINT
   ;; itself and exits 130, so there is nothing to add here.
+  ;;
+  ;; This is only a backstop for what happens outside CLINGON:RUN's own
+  ;; handling -- building the command, say. Everything raised while the command
+  ;; runs is dealt with in HANDLER, which sits inside clingon's handler-case.
   (handler-case (clingon:run (make-app))
-    (pcap-error (e)
-      (format *error-output* "~A~%~
-                              Hint: raw packet send/receive needs root. Try: sudo arp-scan~%" e)
-      (uiop:quit 1))
     (error (e)
       (format *error-output* "Error: ~A~%" e)
       (uiop:quit 1))))

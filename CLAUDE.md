@@ -144,9 +144,21 @@ Layers, bottom-up:
   thread, send a pass across the range, `pump` the queue for `wait-seconds`, then
   retry only the addresses that stayed silent. Also holds watch mode and its
   round-to-round diff.
-- **`src/main.lisp`** — clingon CLI definition and top-level error handling.
+- **`src/main.lisp`** — clingon CLI definition, option-combination checks, and
+  error handling. `dispatch` does the work; `handler` wraps it in the
+  `handler-case` that turns conditions into exit codes.
 
-### Six things that bite
+### Ten things that bite
+
+**Error handling must live inside `handler`, not around `clingon:run`.**
+`clingon:run` wraps the command handler in its own `handler-case` ending in a
+catch-all `error` clause (`clingon/src/command.lisp:873`). Anything signalled
+from the handler is caught there, printed bare, and turned into an exit — it
+never reaches a `handler-case` wrapped around `clingon:run`. The needs-root hint
+for `pcap-error` sat unreachable for exactly this reason until it was moved
+into `handler`. `main`'s remaining `handler-case` is only a backstop for
+failures outside the run, such as building the command. Any new condition that
+needs a specific exit code goes in `handler`.
 
 **The OUI table is baked into the image.** `*oui-table*` is a `defparameter`
 evaluated at *load* time via `asdf:system-relative-pathname`, so the parsed hash
@@ -178,6 +190,22 @@ chattering on the segment — including ones outside the range the user asked fo
 hosts from the local subnet. Passive mode deliberately leaves the scope unset.
 Relatedly, the capture BPF filter excludes our own source MAC, or our outgoing
 broadcasts would come back and register us as a discovered host.
+
+**Ranges are walked, never listed, and user input is validated first.** A
+mistyped `/99` used to make `(ash #xffffffff -67)` zero, so the mask vanished,
+the range became all of IPv4, and the scanner materialized 4.3 billion conses
+before sending a packet — heap exhaustion from one wrong digit. `cidr-range`
+now bounds the prefix and `parse-ip` checks its octets, both signalling
+`invalid-target` so `main` can report a usage error rather than letting a raw
+`parse-integer` or `aref` type error out. `send-pass` walks `first..last`
+directly and returns a count, so nothing proportional to the range is ever
+allocated; retries re-walk with `:skip-answered` instead of building a pending
+list. Keep it that way — a `/8` is 16 million addresses.
+
+**`scan` must not exit the process.** It returns `(values alist status)`, where
+status is a plist of `:unknown` and `:anomalies` counts, and `main` decides what
+that means for `--fail-on-anomaly`. This is library code — `plumb` consumes it
+via `scan-hosts` — and a library call that can terminate its caller is a trap.
 
 **Randomized MACs break anything that treats a MAC as an identity.** Phones and
 laptops rotate their address per SSID and periodically after that, so a

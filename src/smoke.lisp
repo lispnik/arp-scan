@@ -94,6 +94,31 @@ leaves bytes 42.. as the Ethernet padding under test."
         (multiple-value-bind (a b) (arp-scan::cidr-range "192.168.1.0/24")
           (unless (= (1+ (- b a)) 254) (error "got ~D hosts" (1+ (- b a)))))
         "254 hosts")
+      (require! "an out-of-range prefix is rejected, not silently widened"
+        ;; /99 used to make the mask zero, yielding all of IPv4 -- which the
+        ;; scanner then tried to walk, exhausting the heap.
+        (dolist (bad '("192.168.1.0/99" "192.168.1.0/33"))
+          (handler-case (progn (arp-scan::cidr-range bad)
+                               (error "accepted ~A" bad))
+            (arp-scan::invalid-target () t)))
+        "/33 and /99 refused")
+      (require! "malformed ranges are rejected with a usable message"
+        (dolist (bad '("192.168.1.0" "999.1.1.0/24" "192.168.1/24"
+                       "192.168.1.0/abc" "192.168.1.0/" "1.2.3.4.5/24" ""))
+          (handler-case (progn (arp-scan::cidr-range bad)
+                               (error "accepted ~S" bad))
+            (arp-scan::invalid-target () t)))
+        "7 rejected")
+      (require! "/0 is still legal, minus network and broadcast"
+        (multiple-value-bind (a b) (arp-scan::cidr-range "0.0.0.0/0")
+          (unless (and (= a 1) (= b (- (expt 2 32) 2)))
+            (error "got ~A - ~A" a b)))
+        "0.0.0.1 - 255.255.255.254")
+      (require! "valid dotted quads still parse, edges included"
+        (unless (equalp (arp-scan::parse-ip "0.0.0.0") #(0 0 0 0)) (error "0.0.0.0"))
+        (unless (equalp (arp-scan::parse-ip "255.255.255.255") #(255 255 255 255))
+          (error "255.255.255.255"))
+        "0.0.0.0 and 255.255.255.255")
 
       (format t "~%[4] OUI vendor lookup~%")
       (require! "OUI table is populated"

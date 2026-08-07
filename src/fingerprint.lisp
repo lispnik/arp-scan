@@ -86,7 +86,24 @@ whole run."
                          :initial-value 0)))
     (max 0.25 (min 2.0 (* 3 slowest)))))
 
-(defun fingerprint-hosts (handle cap iface hosts &key per-probe-wait)
+(defun drain-watching-for (obs cap ip mac)
+  "Fold everything queued into OBS, reporting whether any of it was a reply
+from IP/MAC.
+
+Everything drained still reaches the observer. An earlier version discarded it,
+which meant that for the whole fingerprinting run -- easily a minute across a
+subnet -- replies from other hosts, and any conflicting or gratuitous claim that
+happened to land, were thrown away unseen."
+  (let ((hit nil))
+    (loop for entry across (capture-drain cap)
+          do (observe-frame obs (car entry) (cdr entry))
+             (multiple-value-bind (op spa sha) (parse-arp (car entry))
+               (when (and op (= op +arp-op-reply+)
+                          (equalp spa ip) (equalp sha mac))
+                 (setf hit t))))
+    hit))
+
+(defun fingerprint-hosts (handle cap obs iface hosts &key per-probe-wait)
   "Probe each host in HOSTS and set its FINGERPRINT to a bit pattern.
 
 One bit per entry in *PROBES*, in order, `1' meaning the host replied. Probes go
@@ -99,20 +116,15 @@ that."
     (dolist (host hosts)
       (let ((bits (make-string-output-stream)))
         (dolist (probe *probes*)
-          ;; Discard anything already queued so the wait below can only see
-          ;; replies drawn by this probe.
-          (capture-drain cap)
+          ;; Clear the queue first so the wait below can only credit this probe
+          ;; -- but hand what was queued to the observer rather than binning it.
+          (drain-watching-for obs cap (host-ip host) (host-mac host))
           (pcap-sendpacket handle (probe-frame probe src-mac src-ip (host-ip host)))
           (let ((deadline (+ (capture-now) per-probe-wait))
                 (answered nil))
             (loop until (or answered (>= (capture-now) deadline))
-                  do (loop for entry across (capture-drain cap)
-                           do (multiple-value-bind (op spa sha)
-                                  (parse-arp (car entry))
-                                (when (and op (= op +arp-op-reply+)
-                                           (equalp spa (host-ip host))
-                                           (equalp sha (host-mac host)))
-                                  (setf answered t))))
+                  do (setf answered
+                           (drain-watching-for obs cap (host-ip host) (host-mac host)))
                      (unless answered (sleep 0.005)))
             (write-char (if answered #\1 #\0) bits)))
         (setf (host-fingerprint host) (get-output-stream-string bits))))
