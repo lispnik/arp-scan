@@ -22,6 +22,35 @@
 (defun u16-be (vec offset)
   (logior (ash (aref vec offset) 8) (aref vec (1+ offset))))
 
+(defun mac-for (u32)
+  "A distinct MAC per address, so synthetic hosts do not look like one MAC
+claiming many IPs.
+
+Built on a real OUI (DC:A6:32, Raspberry Pi) rather than an arbitrary prefix:
+it keeps the vendor lookup exercised, and it is globally administered, so these
+hosts do not all come back as randomized."
+  (make-array 6 :element-type '(unsigned-byte 8)
+                :initial-contents (list #xdc #xa6 #x32
+                                        (ldb (byte 8 16) u32)
+                                        (ldb (byte 8 8) u32)
+                                        (ldb (byte 8 0) u32))))
+
+(defun make-fake-net (cap &key responds-p (sent (list 0)))
+  "A SEND-FN for RUN-PASSES that answers on behalf of a simulated network.
+
+RESPONDS-P is called with the target and the 1-based pass number for that
+target; a true return queues a reply, as though the host had answered. Counts
+every send into SENT so tests can assert that retries narrow."
+  (let ((attempts (make-hash-table)))
+    (lambda (u32)
+      (incf (first sent))
+      (let ((n (incf (gethash u32 attempts 0))))
+        (when (funcall responds-p u32 n)
+          (arp-scan::capture-push
+           cap
+           (make-arp-frame :op 2 :spa (arp-scan::u32->ip u32) :sha (mac-for u32))
+           (arp-scan::capture-now)))))))
+
 (defun make-arp-frame (&key (op 2) (sha #(#x02 0 0 0 0 #x11)) (spa #(10 0 0 1))
                             (tha #(0 0 0 0 0 0)) (tpa #(10 0 0 99))
                             (pad 0) (length 60))
@@ -501,7 +530,97 @@ leaves bytes 42.. as the Ethernet padding under test."
               (unless (= 60 (length frame))
                 (error "~A produced ~D bytes" (arp-scan::probe-name probe) (length frame)))
               (incf built)))
-          (format nil "~D built" built))))
+          (format nil "~D built" built)))
+
+      ;; The scan loop itself, driven with a stub in place of libpcap. RUN-PASSES
+      ;; holds no handles, and the capture queue takes plain byte vectors, so the
+      ;; whole pass/retry cycle runs here with no NIC and no root.
+      (format t "~%[16] Scan loop~%")
+      (let ((base (arp-scan::ip->u32 #(10 0 0 0))))
+        (flet ((run (responds-p &key (retry 2) (first (+ base 1)) (last (+ base 10)))
+                 (let* ((cap (arp-scan::make-capture))
+                        (obs (arp-scan::make-observer))
+                        (sent (list 0))
+                        (send-fn (make-fake-net cap :responds-p responds-p :sent sent)))
+                   (arp-scan::run-passes send-fn cap obs first last
+                                         :per-host-delay-us 0 :wait-seconds 0
+                                         :retry retry)
+                   (values obs (first sent)))))
+
+          (require! "a fully responsive range is found in one pass"
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32 n)) t))
+              (let ((found (hash-table-count (arp-scan::observer-hosts obs))))
+                (unless (= found 10) (error "found ~D of 10" found))
+                ;; 10 asked once; the first retry finds nothing to ask and stops.
+                (unless (= sent 10) (error "sent ~D, expected 10" sent))
+                (format nil "10 hosts, ~D sends" sent))))
+
+          (require! "retries re-ask only the addresses that stayed silent"
+            (multiple-value-bind (obs sent)
+                ;; Only the first three ever answer.
+                (run (lambda (u32 n) (declare (ignore n)) (<= u32 (+ base 3))))
+              (let ((found (hash-table-count (arp-scan::observer-hosts obs))))
+                (unless (= found 3) (error "found ~D of 3" found))
+                ;; 10 in the first pass, then 7 silent ones twice over.
+                (unless (= sent (+ 10 7 7)) (error "sent ~D, expected 24" sent))
+                (format nil "3 hosts, ~D sends" sent))))
+
+          (require! "a host that only answers on the second try is still found"
+            ;; This is the entire reason --retry exists: one dropped reply
+            ;; should not read as a dead address.
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32)) (>= n 2)))
+              (let ((found (hash-table-count (arp-scan::observer-hosts obs))))
+                (unless (= found 10) (error "found ~D of 10" found))
+                (unless (= sent 20) (error "sent ~D, expected 20" sent))
+                (format nil "10 hosts after retry, ~D sends" sent))))
+
+          (require! "retry 0 means exactly one pass"
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32)) (>= n 2)) :retry 0)
+              (unless (zerop (hash-table-count (arp-scan::observer-hosts obs)))
+                (error "found hosts without a retry"))
+              (unless (= sent 10) (error "sent ~D, expected 10" sent))
+              "1 pass, 10 sends"))
+
+          (require! "a silent range yields nothing and gives up after its retries"
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32 n)) nil))
+              (unless (zerop (hash-table-count (arp-scan::observer-hosts obs)))
+                (error "invented hosts"))
+              (unless (= sent 30) (error "sent ~D, expected 30" sent))
+              "0 hosts, 3 full passes"))
+
+          (require! "replies carry through to vendor and round-trip time"
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32 n)) t)
+                     :first (+ base 1) :last (+ base 1))
+              (declare (ignore sent))
+              (let ((host (gethash (+ base 1) (arp-scan::observer-hosts obs))))
+                (unless host (error "no host"))
+                (unless (arp-scan::host-rtt host) (error "no rtt measured"))
+                (unless (eq :global (arp-scan::host-kind host))
+                  (error "kind ~S" (arp-scan::host-kind host)))
+                (let ((vendor (arp-scan::host-vendor host)))
+                  (unless (and vendor (search "Raspberry" vendor))
+                    (error "vendor ~S" vendor))
+                  (format nil "~A, rtt ~,3F ms"
+                          vendor (* 1000 (arp-scan::host-rtt host)))))))
+
+          (require! "a wide range is walked, not listed"
+            ;; A /16 with nothing answering. The point is that it completes at
+            ;; all: this loop used to cons one cell per address up front, which
+            ;; is how a mistyped prefix exhausted the heap.
+            (let ((wide-first (arp-scan::ip->u32 #(10 1 0 1)))
+                  (wide-last (arp-scan::ip->u32 #(10 1 255 254))))
+              (multiple-value-bind (obs sent)
+                  (run (lambda (u32 n) (declare (ignore u32 n)) nil)
+                       :retry 0 :first wide-first :last wide-last)
+                (declare (ignore obs))
+                (unless (= sent (1+ (- wide-last wide-first)))
+                  (error "sent ~D of ~D" sent (1+ (- wide-last wide-first))))
+                (format nil "~:D addresses" sent)))))))
 
     (format t "~%~A~%" (if all-ok "All checks passed." "FAILED."))
     (uiop:quit (if all-ok 0 1))))

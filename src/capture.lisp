@@ -50,11 +50,17 @@ millisecond, whereas a drain may be up to a full pump interval later."
 (defun capture-drain (cap)
   "Hand back every frame queued so far as a vector of (frame . arrival-time),
 leaving CAP empty. Swaps in a fresh queue rather than copying, so the lock is
-held for O(1)."
+held for O(1).
+
+The empty case returns a shared constant instead of allocating. This runs once
+per target address, so on a large range the replacement queues were by far the
+bulk of what the scan allocated -- and almost all of those drains find nothing."
   (bt:with-lock-held ((capture-lock cap))
-    (let ((frames (capture-queue cap)))
-      (setf (capture-queue cap) (make-array 256 :adjustable t :fill-pointer 0))
-      frames)))
+    (if (zerop (fill-pointer (capture-queue cap)))
+        #()
+        (let ((frames (capture-queue cap)))
+          (setf (capture-queue cap) (make-array 256 :adjustable t :fill-pointer 0))
+          frames))))
 
 (defun capture-loop (cap)
   "Body of the capture thread: pull frames until asked to stop."

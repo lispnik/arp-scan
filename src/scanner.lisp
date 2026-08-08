@@ -44,29 +44,49 @@ further SECONDS."
     ;; sitting in the queue.
     (observe-frames obs (capture-drain cap))))
 
-(defun send-pass (handle cap obs src-mac src-ip first last per-host-delay-us
-                  &key skip-answered)
-  "Send an ARP request across the range FIRST..LAST, draining as we go.
-Returns how many were sent. With SKIP-ANSWERED, addresses that already replied
-are passed over, which is what makes each retry cheaper than the last.
+(defun send-pass (send-fn cap obs first last per-host-delay-us &key skip-answered)
+  "Ask every address in FIRST..LAST, draining replies as we go. Returns how many
+were asked. With SKIP-ANSWERED, addresses that already replied are passed over,
+which is what makes each retry cheaper than the last.
+
+SEND-FN takes a target as a u32 and transmits. Passing it in rather than a pcap
+handle is what lets the smoke test drive this loop with a stub, no NIC and no
+root -- the capture queue already deals in plain byte vectors.
 
 The range is walked rather than listed. Materializing it cost one cons per
 address before a single packet went out -- fine for a /24, 16 million for a /8,
 and the mechanism by which a bad prefix used to exhaust the heap.
 
-The send stamp is taken immediately after the frame is handed to libpcap, on the
-same monotonic clock the capture thread stamps arrivals with, so the difference
-is a real round trip rather than a comparison across two clock domains."
+The send stamp is taken immediately after the frame goes out, on the same
+monotonic clock the capture thread stamps arrivals with, so the difference is a
+real round trip rather than a comparison across two clock domains."
   (let ((sent 0))
     (loop for u32 from first to last
           unless (and skip-answered (observer-seen-p obs u32))
-            do (pcap-sendpacket handle (build-arp-request src-mac src-ip (u32->ip u32)))
+            do (funcall send-fn u32)
                (note-send obs u32 (capture-now))
                (observe-frames obs (capture-drain cap))
                (incf sent)
                (when (plusp per-host-delay-us)
                  (sleep (/ per-host-delay-us 1.0d6))))
     sent))
+
+(defun run-passes (send-fn cap obs first last
+                   &key (per-host-delay-us 1000) (wait-seconds 2) (retry 2))
+  "The scan loop proper: one pass over the range, then up to RETRY further
+passes over whoever stayed silent, listening WAIT-SECONDS after each.
+
+Holds no handles and opens nothing, so it is exercised directly by the smoke
+test. Returns OBS."
+  (send-pass send-fn cap obs first last per-host-delay-us)
+  (pump cap obs wait-seconds)
+  ;; Retries cover only the silent addresses, so each pass is cheaper than the
+  ;; one before it. Stop early once a pass has nothing left to ask.
+  (loop repeat retry
+        while (plusp (send-pass send-fn cap obs first last per-host-delay-us
+                                :skip-answered t))
+        do (pump cap obs wait-seconds))
+  obs)
 
 (defun make-scan-observer (format padding anomalies-only)
   "An observer wired for streaming output under text format; silent otherwise,
@@ -118,17 +138,13 @@ stdout has to stay machine-readable."
                 (when header-p
                   (format progress *text-row-fmt* "IP" "MAC" "Vendor"))
                 (force-output progress)
-                (send-pass send-handle cap obs src-mac src-ip first last
-                           per-host-delay-us)
-                (pump cap obs wait-seconds)
-                ;; Retries cover only the silent addresses, so each pass is
-                ;; cheaper than the one before it. Stop early once a pass has
-                ;; nothing left to ask.
-                (loop repeat retry
-                      while (plusp (send-pass send-handle cap obs src-mac src-ip
-                                              first last per-host-delay-us
-                                              :skip-answered t))
-                      do (pump cap obs wait-seconds))
+                (run-passes (lambda (u32)
+                              (pcap-sendpacket
+                               send-handle
+                               (build-arp-request src-mac src-ip (u32->ip u32))))
+                            cap obs first last
+                            :per-host-delay-us per-host-delay-us
+                            :wait-seconds wait-seconds :retry retry)
                 ;; Fingerprinting probes hosts we have already found, so it
                 ;; runs last and only over what actually answered.
                 (when fingerprint

@@ -83,6 +83,15 @@ non-zero on any failure.
 observer get driven without a live capture. Keep new logic reachable from plain
 byte vectors so it stays testable this way.
 
+Section `[16]` drives the scan loop itself. `run-passes` takes a send function
+rather than a pcap handle, so `make-fake-net` can stand in for the network:
+it counts sends and queues replies on behalf of whichever addresses the test
+says should answer, on whichever attempt. That covers the pass/retry cycle —
+retries narrowing to silent addresses, a host answering only on the second try,
+`--retry 0` meaning one pass — with no NIC and no root. Anything added to the
+scan loop belongs behind that seam; if it needs a handle to test, it is in the
+wrong function.
+
 There is no per-test runner. To run one check in isolation, load the system in a
 REPL and call the internal function directly (e.g. `(arp-scan::cidr-range
 "10.0.0.0/30")`). To add a check, add a `require!` form inside `main` in
