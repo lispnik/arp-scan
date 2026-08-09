@@ -19,6 +19,7 @@
                              (:file "observer")
                              (:file "output")
                              (:file "baseline")
+                             (:file "hooks")
                              (:file "fingerprint")
                              (:file "scanner")
                              (:file "main"))))

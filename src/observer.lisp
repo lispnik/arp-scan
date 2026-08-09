@@ -22,6 +22,7 @@ causes are common (see NOTE-MAC-CLAIM), so this only ever produces a remark.")
   (kind :global)                        ; :global | :randomized | :multicast
   rtt                                   ; seconds from request to reply, or NIL
   fingerprint                           ; probe-response bitmask string, or NIL
+  vlan                                  ; 802.1Q id the host was seen on, or NIL
   first-seen                            ; universal time
   last-seen
   (reply-count 0)
@@ -44,7 +45,7 @@ causes are common (see NOTE-MAC-CLAIM), so this only ever produces a remark.")
   (anomalies '())
   (reported-multi-ip (make-hash-table))  ; mac-u48 -> t, so we remark only once
   (send-times (make-hash-table))        ; ip-u32 -> monotonic seconds of last request
-  scope                                 ; (lo . hi) u32 bounds, or NIL for anything
+  scope                                 ; list of (lo . hi) segments, NIL for anything
   on-host                               ; called with a HOST on first sighting
   on-anomaly)                           ; called with an ANOMALY as it is raised
 
@@ -57,7 +58,7 @@ mode, but during an explicit -r scan it would quietly return addresses outside
 the range the user asked for."
   (let ((scope (observer-scope obs)))
     (or (null scope)
-        (<= (car scope) ip-u32 (cdr scope)))))
+        (in-segments-p scope ip-u32))))
 
 (defun zero-bytes-p (v)
   (every #'zerop v))
@@ -131,7 +132,7 @@ either way they measure something other than what we asked."
 
 (defun observe-frame (obs frame &optional arrived-at)
   "Fold one captured frame into OBS. Returns the HOST it concerns, or NIL."
-  (multiple-value-bind (op spa sha tpa tha padding) (parse-arp frame)
+  (multiple-value-bind (op spa sha tpa tha padding vlan) (parse-arp frame)
     (declare (ignore tha))
     (when (and op
                (or (= op +arp-op-request+) (= op +arp-op-reply+))
@@ -149,6 +150,7 @@ either way they measure something other than what we asked."
           (setf host (make-host :ip spa :mac (copy-seq sha)
                                 :vendor (oui-lookup sha)
                                 :kind (mac-kind sha)
+                                :vlan vlan
                                 :first-seen now :last-seen now)
                 (gethash key (observer-hosts obs)) host)
           ;; No NIC owns a multicast address, so a frame sourced from one is

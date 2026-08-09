@@ -19,8 +19,12 @@
 Excluding our own source MAC matters once requests are parsed as well as
 replies: our outgoing broadcasts would otherwise come straight back and
 register us as a discovered host. Doing it in the kernel beats filtering in
-Lisp."
-  (format nil "arp and not ether src ~A" (format-mac src-mac)))
+Lisp.
+
+The `vlan' arm is not redundant. libpcap's `arp' primitive tests the ethertype
+at a fixed offset, so it never matches a tagged frame -- on a trunk port the
+plain filter yields nothing at all."
+  (format nil "(arp or (vlan and arp)) and not ether src ~A" (format-mac src-mac)))
 
 (defun open-capture (iface)
   "Open the listening handle, filtered and ready for the capture thread."
@@ -44,10 +48,13 @@ further SECONDS."
     ;; sitting in the queue.
     (observe-frames obs (capture-drain cap))))
 
-(defun send-pass (send-fn cap obs first last per-host-delay-us &key skip-answered)
-  "Ask every address in FIRST..LAST, draining replies as we go. Returns how many
+(defun send-pass (send-fn cap obs segments per-host-delay-us &key skip-answered)
+  "Ask every address in SEGMENTS, draining replies as we go. Returns how many
 were asked. With SKIP-ANSWERED, addresses that already replied are passed over,
 which is what makes each retry cheaper than the last.
+
+SEGMENTS is a list of (lo . hi) u32 bounds, so a scan can cover several disjoint
+pieces of address space in one run.
 
 SEND-FN takes a target as a u32 and transmits. Passing it in rather than a pcap
 handle is what lets the smoke test drive this loop with a stub, no NIC and no
@@ -57,45 +64,50 @@ The range is walked rather than listed. Materializing it cost one cons per
 address before a single packet went out -- fine for a /24, 16 million for a /8,
 and the mechanism by which a bad prefix used to exhaust the heap.
 
-The send stamp is taken immediately after the frame goes out, on the same
-monotonic clock the capture thread stamps arrivals with, so the difference is a
-real round trip rather than a comparison across two clock domains."
+The send is stamped just *before* the frame goes out, on the same monotonic
+clock the capture thread stamps arrivals with, so the difference is a real round
+trip rather than a comparison across two clock domains. Stamping afterwards
+loses any reply that lands between the transmit returning and the stamp being
+taken -- RECORD-RTT discards an arrival earlier than its send -- which costs a
+few microseconds of accuracy to avoid dropping measurements outright."
   (let ((sent 0))
-    (loop for u32 from first to last
-          unless (and skip-answered (observer-seen-p obs u32))
-            do (funcall send-fn u32)
-               (note-send obs u32 (capture-now))
-               (observe-frames obs (capture-drain cap))
-               (incf sent)
-               (when (plusp per-host-delay-us)
-                 (sleep (/ per-host-delay-us 1.0d6))))
+    (loop for (lo . hi) in segments
+          do (loop for u32 from lo to hi
+                   unless (and skip-answered (observer-seen-p obs u32))
+                     do (note-send obs u32 (capture-now))
+                        (funcall send-fn u32)
+                        (observe-frames obs (capture-drain cap))
+                        (incf sent)
+                        (when (plusp per-host-delay-us)
+                          (sleep (/ per-host-delay-us 1.0d6)))))
     sent))
 
-(defun run-passes (send-fn cap obs first last
+(defun run-passes (send-fn cap obs segments
                    &key (per-host-delay-us 1000) (wait-seconds 2) (retry 2))
-  "The scan loop proper: one pass over the range, then up to RETRY further
+  "The scan loop proper: one pass over SEGMENTS, then up to RETRY further
 passes over whoever stayed silent, listening WAIT-SECONDS after each.
 
 Holds no handles and opens nothing, so it is exercised directly by the smoke
 test. Returns OBS."
-  (send-pass send-fn cap obs first last per-host-delay-us)
+  (send-pass send-fn cap obs segments per-host-delay-us)
   (pump cap obs wait-seconds)
   ;; Retries cover only the silent addresses, so each pass is cheaper than the
   ;; one before it. Stop early once a pass has nothing left to ask.
   (loop repeat retry
-        while (plusp (send-pass send-fn cap obs first last per-host-delay-us
+        while (plusp (send-pass send-fn cap obs segments per-host-delay-us
                                 :skip-answered t))
         do (pump cap obs wait-seconds))
   obs)
 
-(defun make-scan-observer (format padding anomalies-only)
+(defun make-scan-observer (format padding anomalies-only &key on-anomaly-hook)
   "An observer wired for streaming output under text format; silent otherwise,
 since json and csv cannot be emitted until the run is complete."
   (make-observer
    :on-host (when (and (eq format :text) (not anomalies-only))
               (lambda (host) (print-host-text host :padding padding)))
-   :on-anomaly (when (eq format :text)
-                 (lambda (a) (print-anomaly-text a)))))
+   :on-anomaly (lambda (a)
+                 (when (eq format :text) (print-anomaly-text a))
+                 (when on-anomaly-hook (anomaly-hook on-anomaly-hook a)))))
 
 (defun scan-once (&key iface obs cidr passive (per-host-delay-us 1000)
                        (wait-seconds 2) (retry 2) fingerprint
@@ -126,14 +138,27 @@ stdout has to stay machine-readable."
              (t
               (setf send-handle (pcap-open-live (iface-name iface)
                                                 :snaplen 96 :promisc nil :timeout-ms 50))
-              (multiple-value-bind (first last)
-                  (if cidr (cidr-range cidr) (subnet-range-from-iface iface))
+              (let ((segments (if cidr
+                                  (parse-targets cidr)
+                                  (multiple-value-bind (lo hi)
+                                      (subnet-range-from-iface iface)
+                                    (list (cons lo hi))))))
                 ;; Report only what was asked for. Ambient ARP chatter from
                 ;; outside the range is still captured -- it just is not ours
                 ;; to report here. Use --passive for that.
-                (setf (observer-scope obs) (cons first last))
-                (format progress "Scanning ~A - ~A on ~A (~A, ~A)~%"
-                        (format-ip (u32->ip first)) (format-ip (u32->ip last))
+                (setf (observer-scope obs) segments)
+                (format progress "Scanning ~{~A~^, ~} (~:D ~A) on ~A (~A, ~A)~%"
+                        (mapcar (lambda (s)
+                                  (if (= (car s) (cdr s))
+                                      (format-ip (u32->ip (car s)))
+                                      (format nil "~A - ~A"
+                                              (format-ip (u32->ip (car s)))
+                                              (format-ip (u32->ip (cdr s))))))
+                                segments)
+                        (segments-count segments)
+                        ;; ~P would give "addresss"; the plural of address is
+                        ;; not formed by adding an s.
+                        (if (= 1 (segments-count segments)) "address" "addresses")
                         (iface-name iface) (format-ip src-ip) (format-mac src-mac))
                 (when header-p
                   (format progress *text-row-fmt* "IP" "MAC" "Vendor"))
@@ -142,7 +167,7 @@ stdout has to stay machine-readable."
                               (pcap-sendpacket
                                send-handle
                                (build-arp-request src-mac src-ip (u32->ip u32))))
-                            cap obs first last
+                            cap obs segments
                             :per-host-delay-us per-host-delay-us
                             :wait-seconds wait-seconds :retry retry)
                 ;; Fingerprinting probes hosts we have already found, so it
@@ -167,7 +192,7 @@ stdout has to stay machine-readable."
 
 ;;; Watch mode
 
-(defun watch-round-diff (obs previous progress &key (gone-after 3))
+(defun watch-round-diff (obs previous progress &key (gone-after 3) on-new-host)
   "Report what changed since the last round; return the new snapshot.
 
 Both PREVIOUS and the return value map ip-u32 -> (mac . consecutive-misses). A
@@ -181,12 +206,19 @@ not a departure, and reporting it as one would make watch mode unreadable."
         (cond ((null prior)
                (format progress "  + ~A  ~A  ~A~%"
                        (format-ip (host-ip host)) (format-mac (host-mac host))
-                       (or (host-vendor host) "")))
+                       (or (host-vendor host) ""))
+               ;; A rotating address is new every time it rotates, so hooking on
+               ;; it would mean an alert per phone per round.
+               (when (and on-new-host (not (eq (host-kind host) :randomized)))
+                 (host-hook on-new-host host "new")))
               ((not (equalp (car prior) (host-mac host)))
                ;; The one to actually care about: a live address changing hands.
+               ;; Hooked whatever the new MAC looks like -- a takeover is a
+               ;; takeover even if the address that did it is randomized.
                (format progress "  ! ~A  ~A -> ~A~%"
                        (format-ip (host-ip host))
-                       (format-mac (car prior)) (format-mac (host-mac host)))))))
+                       (format-mac (car prior)) (format-mac (host-mac host)))
+               (when on-new-host (host-hook on-new-host host "changed"))))))
     (maphash (lambda (key prior)
                (unless (gethash key current)
                  (let ((missed (1+ (cdr prior))))
@@ -201,7 +233,8 @@ not a departure, and reporting it as one would make watch mode unreadable."
     current))
 
 (defun watch-loop (iface progress &key cidr passive per-host-delay-us wait-seconds
-                                       retry interval padding baseline)
+                                       retry interval padding baseline
+                                       on-new-host on-anomaly)
   "Rescan on an interval, reporting only what changed between rounds.
 
 Each round gets its own observer; continuity lives in the snapshot threaded
@@ -214,14 +247,20 @@ through WATCH-ROUND-DIFF, which is also what suppresses flapping."
   (let ((previous (make-hash-table))
         (known (when baseline (read-baseline baseline))))
     (loop for round from 1
-          do (let ((obs (make-observer)))
+          do (let ((obs (make-observer
+                         ;; Anomalies fire their hook as they are raised, which
+                         ;; is the whole point -- a poisoning attempt should not
+                         ;; wait for the round to finish.
+                         :on-anomaly (when on-anomaly
+                                       (lambda (a) (anomaly-hook on-anomaly a))))))
                (scan-once :iface iface :obs obs :cidr cidr :passive passive
                           :per-host-delay-us per-host-delay-us
                           :wait-seconds wait-seconds :retry retry
                           :progress progress)
                (format progress "~&[round ~D] ~D host~:P~%" round
                        (hash-table-count (observer-hosts obs)))
-               (setf previous (watch-round-diff obs previous progress))
+               (setf previous (watch-round-diff obs previous progress
+                                                :on-new-host on-new-host))
                (dolist (a (reverse (observer-anomalies obs)))
                  (print-anomaly-text a :stream progress))
                ;; Only unknowns are worth repeating every round; the full
@@ -263,7 +302,8 @@ broadcast stream with no components, which is the portable bit bucket."
 
 (defun scan (&key interface cidr (per-host-delay-us 1000) (wait-seconds 2)
                   (retry 2) passive watch (format :text) padding anomalies-only
-                  rtt fingerprint baseline ((:write-baseline baseline-out) nil))
+                  rtt fingerprint baseline ((:write-baseline baseline-out) nil)
+                  on-new-host on-anomaly)
   "Scan a subnet for hosts via ARP.
 
 Returns (values alist status), where ALIST is (ip . mac) pairs and STATUS is a
@@ -283,7 +323,7 @@ FORMAT is one of :text :json :jsonl :csv.
 RTT reports per-host round-trip times.
 FINGERPRINT probes each host with the malformed-frame matrix.
 BASELINE is a known-hosts path to compare against; WRITE-BASELINE one to save to.
-FAIL-ON-ANOMALY exits non-zero when anomalies or unknown hosts turn up."
+ON-NEW-HOST and ON-ANOMALY are commands to run when those turn up."
   (let ((iface (if interface (find-iface interface) (default-iface))))
     (if watch
         ;; Watch mode is inherently a running commentary, so it always reports
@@ -292,8 +332,10 @@ FAIL-ON-ANOMALY exits non-zero when anomalies or unknown hosts turn up."
                     :cidr cidr :passive passive
                     :per-host-delay-us per-host-delay-us
                     :wait-seconds wait-seconds :retry retry
-                    :interval watch :padding padding :baseline baseline)
-        (let ((obs (make-scan-observer format padding anomalies-only)))
+                    :interval watch :padding padding :baseline baseline
+                    :on-new-host on-new-host :on-anomaly on-anomaly)
+        (let ((obs (make-scan-observer format padding anomalies-only
+                                       :on-anomaly-hook on-anomaly)))
           (scan-once :iface iface :obs obs :cidr cidr :passive passive
                      :per-host-delay-us per-host-delay-us
                      :wait-seconds wait-seconds :retry retry
@@ -307,8 +349,18 @@ FAIL-ON-ANOMALY exits non-zero when anomalies or unknown hosts turn up."
             (when (and fingerprint (eq format :text))
               (print-fingerprints hosts))
             (when baseline
-              (setf unknown (report-baseline (read-baseline baseline) hosts
-                                             :stream (progress-stream format))))
+              (let ((known (read-baseline baseline)))
+                (setf unknown (report-baseline known hosts
+                                               :stream (progress-stream format)))
+                ;; Outside watch mode, "new" can only mean "not in the
+                ;; baseline" -- there is no previous round to compare against.
+                ;; Randomized MACs are skipped for the same reason they are not
+                ;; counted: they rotate by design, so firing on them would mean
+                ;; an alert per phone per run, burying the one that matters.
+                (when on-new-host
+                  (dolist (host (remove :randomized (unknown-hosts known hosts)
+                                        :key #'host-kind))
+                    (host-hook on-new-host host "unknown")))))
             (when baseline-out
               (format (progress-stream format) "~&Wrote ~D host~:P to ~A~%"
                       (write-baseline baseline-out hosts) baseline-out))

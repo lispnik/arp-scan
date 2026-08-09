@@ -277,8 +277,8 @@ leaves bytes 42.. as the Ethernet padding under test."
           "gratuitous"))
       (require! "an out-of-scope sender is not reported"
         (let ((obs (arp-scan::make-observer
-                    :scope (cons (arp-scan::ip->u32 #(10 0 0 1))
-                                 (arp-scan::ip->u32 #(10 0 0 9))))))
+                    :scope (list (cons (arp-scan::ip->u32 #(10 0 0 1))
+                                       (arp-scan::ip->u32 #(10 0 0 9)))))))
           (arp-scan::observe-frame obs (make-arp-frame :spa #(10 0 0 5)))
           (arp-scan::observe-frame obs (make-arp-frame :spa #(192 168 1 1)))
           (unless (= 1 (hash-table-count (arp-scan::observer-hosts obs)))
@@ -537,12 +537,14 @@ leaves bytes 42.. as the Ethernet padding under test."
       ;; whole pass/retry cycle runs here with no NIC and no root.
       (format t "~%[16] Scan loop~%")
       (let ((base (arp-scan::ip->u32 #(10 0 0 0))))
-        (flet ((run (responds-p &key (retry 2) (first (+ base 1)) (last (+ base 10)))
+        (flet ((run (responds-p &key (retry 2) (first (+ base 1)) (last (+ base 10))
+                                     segments)
                  (let* ((cap (arp-scan::make-capture))
                         (obs (arp-scan::make-observer))
                         (sent (list 0))
                         (send-fn (make-fake-net cap :responds-p responds-p :sent sent)))
-                   (arp-scan::run-passes send-fn cap obs first last
+                   (arp-scan::run-passes send-fn cap obs
+                                         (or segments (list (cons first last)))
                                          :per-host-delay-us 0 :wait-seconds 0
                                          :retry retry)
                    (values obs (first sent)))))
@@ -602,11 +604,23 @@ leaves bytes 42.. as the Ethernet padding under test."
                 (unless (arp-scan::host-rtt host) (error "no rtt measured"))
                 (unless (eq :global (arp-scan::host-kind host))
                   (error "kind ~S" (arp-scan::host-kind host)))
+                (unless (>= (arp-scan::host-rtt host) 0)
+                  (error "negative rtt ~F" (arp-scan::host-rtt host)))
                 (let ((vendor (arp-scan::host-vendor host)))
                   (unless (and vendor (search "Raspberry" vendor))
                     (error "vendor ~S" vendor))
                   (format nil "~A, rtt ~,3F ms"
                           vendor (* 1000 (arp-scan::host-rtt host)))))))
+
+          (require! "disjoint segments are all covered in one run"
+            (multiple-value-bind (obs sent)
+                (run (lambda (u32 n) (declare (ignore u32 n)) t)
+                     :segments (list (cons (+ base 1) (+ base 3))
+                                     (cons (+ base 100) (+ base 102))))
+              (let ((found (hash-table-count (arp-scan::observer-hosts obs))))
+                (unless (= found 6) (error "found ~D of 6" found))
+                (unless (= sent 6) (error "sent ~D of 6" sent))
+                "2 segments, 6 hosts")))
 
           (require! "a wide range is walked, not listed"
             ;; A /16 with nothing answering. The point is that it completes at
@@ -620,7 +634,152 @@ leaves bytes 42.. as the Ethernet padding under test."
                 (declare (ignore obs))
                 (unless (= sent (1+ (- wide-last wide-first)))
                   (error "sent ~D of ~D" sent (1+ (- wide-last wide-first))))
-                (format nil "~:D addresses" sent)))))))
+                (format nil "~:D addresses" sent))))))
+
+      (format t "~%[17] VLAN-tagged frames~%")
+      (flet ((tagged (&key (tpid arp-scan::+ethertype-vlan+) (vid 100) (tags 1))
+               ;; An 802.1Q tag is four bytes between the source MAC and the
+               ;; ethertype, so everything after it shifts.
+               (let* ((shift (* 4 tags))
+                      (f (make-array (+ 64 shift) :element-type '(unsigned-byte 8)
+                                                  :initial-element 0)))
+                 (dotimes (i tags)
+                   (arp-scan::set-u16-be f (+ 12 (* 4 i)) tpid)
+                   (arp-scan::set-u16-be f (+ 14 (* 4 i)) vid))
+                 (arp-scan::set-u16-be f (+ 12 shift) #x0806)     ; ethertype ARP
+                 (arp-scan::set-u16-be f (+ 20 shift) 2)          ; opcode reply
+                 (replace f #(#x02 0 0 0 0 #x11) :start1 (+ 22 shift))
+                 (replace f #(10 0 0 7) :start1 (+ 28 shift))
+                 f)))
+        (require! "a tagged ARP reply parses, with its VLAN id"
+          (multiple-value-bind (op spa sha tpa tha pad vlan)
+              (arp-scan::parse-arp (tagged :vid 100))
+            (declare (ignore sha tpa tha pad))
+            (unless op (error "not recognized as ARP at all"))
+            (unless (= op 2) (error "op ~D" op))
+            (unless (equalp spa #(10 0 0 7)) (error "spa ~A" (hex-bytes spa)))
+            (unless (eql vlan 100) (error "vlan ~S" vlan))
+            (format nil "vlan 100, ~A" (arp-scan::format-ip spa))))
+        (require! "the priority bits are not mistaken for the VLAN id"
+          ;; The id is the low 12 bits of the TCI; the top 4 are priority and
+          ;; the drop-eligible flag.
+          (multiple-value-bind (op spa sha tpa tha pad vlan)
+              (arp-scan::parse-arp (tagged :vid #xE064))
+            (declare (ignore op spa sha tpa tha pad))
+            (unless (eql vlan 100) (error "vlan ~S, expected 100" vlan))
+            "100"))
+        (require! "a QinQ double tag is unwrapped"
+          (multiple-value-bind (op spa sha tpa tha pad vlan)
+              (arp-scan::parse-arp (tagged :tpid arp-scan::+ethertype-qinq+
+                                           :vid 200 :tags 2))
+            (declare (ignore sha tpa tha pad))
+            (unless op (error "double-tagged frame not recognized"))
+            (unless (equalp spa #(10 0 0 7)) (error "spa ~A" (hex-bytes spa)))
+            (unless (eql vlan 200) (error "vlan ~S" vlan))
+            "vlan 200"))
+        (require! "an untagged frame still reports no VLAN"
+          (multiple-value-bind (op spa sha tpa tha pad vlan)
+              (arp-scan::parse-arp (make-arp-frame))
+            (declare (ignore spa sha tpa tha pad))
+            (unless op (error "untagged frame stopped parsing"))
+            (when vlan (error "invented vlan ~S" vlan))
+            "nil"))
+        (require! "the capture filter admits tagged frames"
+          (let ((f (arp-scan::capture-filter #(#x02 0 0 0 0 #x11))))
+            (unless (search "vlan" f) (error "no vlan arm: ~A" f))
+            f)))
+
+      (format t "~%[18] Target specifications~%")
+      (require! "a CIDR block parses to one segment"
+        (let ((segs (arp-scan::parse-targets "192.168.1.0/24")))
+          (unless (= 1 (length segs)) (error "~D segments" (length segs)))
+          (unless (= 254 (arp-scan::segments-count segs))
+            (error "~D addresses" (arp-scan::segments-count segs)))
+          "254 addresses"))
+      (require! "a full range parses"
+        (let ((segs (arp-scan::parse-targets "192.168.1.10-192.168.1.50")))
+          (unless (= 41 (arp-scan::segments-count segs))
+            (error "~D addresses" (arp-scan::segments-count segs)))
+          "41 addresses"))
+      (require! "a last-octet shorthand means the same thing"
+        (unless (equal (arp-scan::parse-targets "192.168.1.10-50")
+                       (arp-scan::parse-targets "192.168.1.10-192.168.1.50"))
+          (error "shorthand and long form disagree"))
+        "10-50 == 10-192.168.1.50")
+      (require! "a single address parses"
+        (let ((segs (arp-scan::parse-targets "192.168.1.5")))
+          (unless (= 1 (arp-scan::segments-count segs))
+            (error "~D addresses" (arp-scan::segments-count segs)))
+          "1 address"))
+      (require! "a comma list keeps disjoint pieces apart"
+        (let ((segs (arp-scan::parse-targets "10.0.0.1-3, 10.0.5.1-2")))
+          (unless (= 2 (length segs)) (error "~D segments" (length segs)))
+          (unless (= 5 (arp-scan::segments-count segs))
+            (error "~D addresses" (arp-scan::segments-count segs)))
+          "2 segments, 5 addresses"))
+      (require! "overlapping and abutting specs are merged, not scanned twice"
+        (let ((segs (arp-scan::parse-targets "10.0.0.1-10,10.0.0.5-20,10.0.0.21-30")))
+          (unless (= 1 (length segs))
+            (error "~D segments, expected them merged" (length segs)))
+          (unless (= 30 (arp-scan::segments-count segs))
+            (error "~D addresses" (arp-scan::segments-count segs)))
+          "1 segment, 30 addresses"))
+      (require! "malformed targets are rejected"
+        (dolist (bad '("10.0.0.50-10" "10.0.0.1-999" "10.0.0.1-abc" "" ","))
+          (handler-case (progn (arp-scan::parse-targets bad)
+                               (error "accepted ~S" bad))
+            (arp-scan::invalid-target () t)))
+        "5 rejected")
+
+      (format t "~%[19] Wake-on-LAN~%")
+      (require! "the magic packet has the right shape"
+        (let ((frame (arp-scan::build-wol-packet #(#x02 0 0 0 0 #x11)
+                                                 #(#xdc #xa6 #x32 1 2 3))))
+          (unless (= 116 (length frame)) (error "~D bytes" (length frame)))
+          (unless (equalp (subseq frame 0 6) #(#xdc #xa6 #x32 1 2 3))
+            (error "not addressed to the target"))
+          (unless (= #x0842 (u16-be frame 12)) (error "ethertype"))
+          (unless (every (lambda (b) (= b #xff)) (subseq frame 14 20))
+            (error "missing the 6-byte sync stream"))
+          ;; Sixteen repetitions of the target MAC follow the sync stream.
+          (dotimes (rep 16)
+            (let ((at (+ 20 (* rep 6))))
+              (unless (equalp (subseq frame at (+ at 6)) #(#xdc #xa6 #x32 1 2 3))
+                (error "repetition ~D is wrong" rep))))
+          "116 bytes, 16 repetitions"))
+
+      (format t "~%[20] Hooks~%")
+      (require! "a hook runs and reports success"
+        (unless (arp-scan::run-hook "/usr/bin/true") (error "true failed"))
+        "ran")
+      (require! "a failing hook is reported, not fatal"
+        (let ((noise (make-string-output-stream)))
+          (let ((*error-output* noise))
+            (when (arp-scan::run-hook "/usr/bin/false")
+              (error "reported success for a non-zero exit")))
+          "false -> nil"))
+      (require! "a missing hook binary does not take the scan down"
+        (let ((noise (make-string-output-stream)))
+          (let ((*error-output* noise))
+            (when (arp-scan::run-hook "/nonexistent/arp-scan-hook")
+              (error "reported success for a missing binary")))
+          "survived"))
+      (require! "hook arguments are passed as argv, never through a shell"
+        ;; A vendor string is attacker-chosen; if it reached a shell, this would
+        ;; run the embedded command instead of passing it along as text.
+        (let* ((path (merge-pathnames "arp-scan-smoke-hook-out.txt"
+                                      (uiop:temporary-directory)))
+               (evil (format nil "x; touch ~A" (namestring path))))
+          (unwind-protect
+               (progn
+                 (ignore-errors (delete-file path))
+                 (let ((noise (make-string-output-stream)))
+                   (let ((*error-output* noise))
+                     (arp-scan::run-hook "/bin/echo" evil)))
+                 (when (probe-file path)
+                   (error "the shell interpreted a vendor string"))
+                 "argv only, no shell")
+            (ignore-errors (delete-file path))))))
 
     (format t "~%~A~%" (if all-ok "All checks passed." "FAILED."))
     (uiop:quit (if all-ok 0 1))))

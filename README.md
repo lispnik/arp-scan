@@ -88,6 +88,37 @@ to stderr so stdout stays parseable.
 sudo arp-scan --format json | jq '.hosts[] | select(.mac_kind == "randomized")'
 ```
 
+**Run a command when something happens.** Turns watch mode and baselines from
+reporting into alerting. Details arrive as separate arguments — never through a
+shell, so a hostile vendor string stays a string.
+
+```sh
+sudo arp-scan --watch 60 --on-new-host ./notify.sh --on-anomaly ./page.sh
+```
+
+`--on-new-host` receives `EVENT IP MAC VENDOR KIND VLAN` and needs `--watch` or
+`--baseline` to say what "new" means. `--on-anomaly` receives
+`KIND IP MAC OTHER-MAC DETAIL`. Randomized MACs do not trigger new-host hooks,
+for the same reason they stay out of baselines.
+
+**Pick targets flexibly.** A CIDR block, a range, a single address, or any
+comma-separated mixture. Overlapping pieces are merged so nothing is asked
+twice.
+
+```sh
+sudo arp-scan -r 192.168.1.0/24,10.0.0.5,10.0.0.100-150
+sudo arp-scan --targets hosts.txt      # one spec per line, # for comments
+```
+
+**Wake a machine.**
+
+```sh
+sudo arp-scan --wake DC:A6:32:11:22:33
+```
+
+**VLANs.** Tagged ARP is parsed, including 802.1ad double tags, and the VLAN id
+is recorded per host. Untagged networks are unaffected.
+
 **Other flags.** `--rtt` reports per-host round-trip time, which exposes devices
 sitting behind a bridge or in Wi-Fi power saving. `--retry N` makes extra passes
 over addresses that stayed silent, and measurably finds hosts a single pass

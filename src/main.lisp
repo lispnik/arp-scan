@@ -38,8 +38,51 @@
                         :description "Save the hosts found to a known-hosts file")
    (clingon:make-option :flag                    :long-name "fail-on-anomaly" :key :fail-on-anomaly
                         :description "Exit 2 if anomalies or unknown hosts are found (for cron)")
+   (clingon:make-option :string                  :long-name "on-new-host" :key :on-new-host
+                        :description "Run this command for each new or unknown host")
+   (clingon:make-option :string                  :long-name "on-anomaly" :key :on-anomaly
+                        :description "Run this command for each anomaly raised")
+   (clingon:make-option :string                  :long-name "targets"   :key :targets
+                        :description "File of targets, one per line, # for comments")
+   (clingon:make-option :string                  :long-name "wake"      :key :wake
+                        :description "Send a Wake-on-LAN magic packet to a MAC and exit")
    (clingon:make-option :flag    :short-name #\l :long-name "list"      :key :list
                         :description "List interfaces and exit")))
+
+(defun read-target-file (path)
+  "Read a target file into a comma-separated spec.
+
+Same shape as the baseline file: one entry per line, # starts a comment. That
+keeps a target list something you can maintain in an editor and diff."
+  (unless (probe-file path)
+    (error 'usage-error :message (format nil "No such target file: ~A" path)))
+  (let ((specs '()))
+    (with-open-file (in path :external-format :utf-8)
+      (loop for line = (read-line in nil nil)
+            while line
+            do (let* ((hash (position #\# line))
+                      (body (string-trim '(#\Space #\Tab #\Return)
+                                         (subseq line 0 hash))))
+                 (unless (zerop (length body))
+                   (push body specs)))))
+    (unless specs
+      (error 'usage-error :message (format nil "No targets in ~A" path)))
+    (format nil "~{~A~^,~}" (nreverse specs))))
+
+(defun wake (mac-string interface)
+  "Send a Wake-on-LAN magic packet to MAC-STRING."
+  (let ((mac (or (parse-mac mac-string)
+                 (error 'usage-error :message
+                        (format nil "Not a MAC address: ~S" mac-string))))
+        (iface (if interface (find-iface interface) (default-iface))))
+    (let ((handle (pcap-open-live (iface-name iface)
+                                  :snaplen 96 :promisc nil :timeout-ms 50)))
+      (unwind-protect
+           (progn
+             (pcap-sendpacket handle (build-wol-packet (iface-mac iface) mac))
+             (format t "~&Magic packet sent to ~A on ~A~%"
+                     (format-mac mac) (iface-name iface)))
+        (%pcap-close handle)))))
 
 (define-condition usage-error (error)
   ((message :initarg :message :reader usage-error-message))
@@ -59,17 +102,29 @@ question they asked."
       (error 'usage-error :message
              (format nil "--watch reports changes as they happen and cannot emit ~(~A~): a single document would never be closed off. Use --format text, or drop --watch."
                      format)))
+    (when (and (clingon:getopt cmd :on-new-host)
+               (not (or (clingon:getopt cmd :watch) (clingon:getopt cmd :baseline))))
+      ;; Without one of those there is nothing for "new" to be new against, and
+      ;; the hook would fire once per host on the network.
+      (error 'usage-error :message
+             "--on-new-host needs --watch or --baseline to say what counts as new."))
+    (when (and (clingon:getopt cmd :targets) (clingon:getopt cmd :cidr))
+      (error 'usage-error :message "Use --targets or --range, not both."))
     format))
 
 (defun dispatch (cmd)
   (cond
     ((clingon:getopt cmd :list)
      (list-interfaces))
+    ((clingon:getopt cmd :wake)
+     (wake (clingon:getopt cmd :wake) (clingon:getopt cmd :interface)))
     (t
      (let ((format (check-option-combination cmd)))
        (multiple-value-bind (hosts status)
            (scan :interface         (clingon:getopt cmd :interface)
-                 :cidr              (clingon:getopt cmd :cidr)
+                 :cidr              (or (clingon:getopt cmd :cidr)
+                                        (let ((f (clingon:getopt cmd :targets)))
+                                          (when f (read-target-file f))))
                  :wait-seconds      (clingon:getopt cmd :wait)
                  :per-host-delay-us (clingon:getopt cmd :delay)
                  :retry             (clingon:getopt cmd :retry)
@@ -81,7 +136,9 @@ question they asked."
                  :rtt               (clingon:getopt cmd :rtt)
                  :fingerprint       (clingon:getopt cmd :fingerprint)
                  :baseline          (clingon:getopt cmd :baseline)
-                 :write-baseline    (clingon:getopt cmd :write-baseline))
+                 :write-baseline    (clingon:getopt cmd :write-baseline)
+                 :on-new-host       (clingon:getopt cmd :on-new-host)
+                 :on-anomaly        (clingon:getopt cmd :on-anomaly))
          (declare (ignore hosts))
          ;; The exit decision lives here, not in SCAN: turning a result into a
          ;; process status is the command's job.

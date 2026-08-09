@@ -50,7 +50,11 @@ keyword arguments.
 | Flag | Key | Default | Effect |
 | --- | --- | --- | --- |
 | `-i/--interface` | `:interface` | best-scoring usable iface | passed to `find-iface` |
-| `-r/--range` | `:cidr` | the iface's own subnet | passed to `cidr-range`; also sets the observer's scope |
+| `-r/--range` | `:cidr` | the iface's own subnet | passed to `parse-targets`; also sets the observer's scope |
+| `--targets` | — | — | file of target specs, folded into `:cidr` by `main` |
+| `--on-new-host` | `:on-new-host` | — | command per new/unknown host; needs `--watch` or `--baseline` |
+| `--on-anomaly` | `:on-anomaly` | — | command per anomaly raised |
+| `--wake` | — | — | send a WoL magic packet and exit; handled entirely in `main` |
 | `-w/--wait` | `:wait` | 2 s | listen window after the last request |
 | `-d/--delay` | `:delay` | 1000 µs | throttle between sent requests |
 | `-t/--retry` | `:retry` | 2 | extra passes over addresses that stayed silent |
@@ -146,6 +150,8 @@ Layers, bottom-up:
 - **`src/baseline.lisp`** — known-hosts file, keyed on MAC because DHCP makes IP
   meaningless as identity. Line-oriented, not JSON: we have a JSON writer but no
   reader, and a flat MAC list does not justify one.
+- **`src/hooks.lisp`** — runs a user command on new hosts and anomalies, passing
+  details as argv. See the shell note below before changing anything here.
 - **`src/fingerprint.lisp`** — the malformed-probe matrix, `build-arp-probe`
   (which lets any field be invalid, unlike `build-arp-request`), and grouping by
   response pattern.
@@ -157,7 +163,7 @@ Layers, bottom-up:
   error handling. `dispatch` does the work; `handler` wraps it in the
   `handler-case` that turns conditions into exit codes.
 
-### Ten things that bite
+### Twelve things that bite
 
 **Error handling must live inside `handler`, not around `clingon:run`.**
 `clingon:run` wraps the command handler in its own `handler-case` ending in a
@@ -199,6 +205,25 @@ chattering on the segment — including ones outside the range the user asked fo
 hosts from the local subnet. Passive mode deliberately leaves the scope unset.
 Relatedly, the capture BPF filter excludes our own source MAC, or our outgoing
 broadcasts would come back and register us as a discovered host.
+
+**A scan is a list of segments, not one range, and VLAN tags shift everything.**
+`parse-targets` returns merged `(lo . hi)` u32 pairs, so `-r` accepts CIDR
+blocks, ranges (`10.0.0.1-50`), single addresses and comma-separated
+combinations; overlapping specs are coalesced so nothing is asked twice.
+`observer-scope` is that same segment list. Separately, an 802.1Q tag sits
+between the source MAC and the ethertype and pushes the ARP payload out four
+bytes (802.1ad stacks two), so `arp-offset` finds the payload rather than
+assuming offset 14 — and the capture filter must be `arp or (vlan and arp)`,
+because libpcap's `arp` primitive tests a fixed offset and never matches a
+tagged frame. Before that, the scanner saw nothing at all on a trunk port.
+
+**Hooks pass data as argv, never through a shell.** Vendor strings come off the
+network and are attacker-chosen; `uiop:run-program` with a list and no
+`:force-shell` executes the file directly, so they can only ever be arguments.
+A smoke check pins this by passing `x; touch <file>` as a vendor and asserting
+the file is not created. Hooks also skip randomized MACs for new-host events,
+matching why they are excluded from the baseline count — otherwise it is one
+alert per phone per round.
 
 **Ranges are walked, never listed, and user input is validated first.** A
 mistyped `/99` used to make `(ash #xffffffff -67)` zero, so the mask vanished,

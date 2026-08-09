@@ -45,8 +45,11 @@
     (copy-into frame 38 target-ip)      ; tpa
     frame))
 
-(defconstant +arp-payload-end+ 42
-  "Offset just past the ARP payload; anything beyond is Ethernet padding.")
+(defconstant +arp-payload-length+ 28
+  "Bytes of ARP payload for IPv4 over Ethernet; anything beyond is padding.")
+
+(defconstant +ethertype-vlan+ #x8100)   ; 802.1Q
+(defconstant +ethertype-qinq+ #x88a8)   ; 802.1ad, an outer tag
 
 (defun subvector (frame start length)
   (let ((out (make-array length :element-type '(unsigned-byte 8))))
@@ -54,29 +57,74 @@
           do (setf (aref out i) (aref frame (+ start i))))
     out))
 
-(defun parse-arp (frame)
-  "Parse any ARP frame, request or reply.
+(defun arp-offset (frame)
+  "Offset of the ARP payload in FRAME, and the VLAN id if it was tagged.
+Returns NIL when FRAME is not ARP at all.
 
-Returns (values op spa sha tpa tha padding), or NIL if FRAME is not ARP.
-PADDING is the Ethernet filler past the 42-byte ARP payload, or NIL when the
-capture was too short to include any. Callers get the padding because the
-sending stack chooses it and some devices leak buffer contents there."
-  (when (and (>= (length frame) +arp-payload-end+)
-             (= (get-u16-be frame 12) +ethertype-arp+))
-    (values (get-u16-be frame 20)             ; op
-            (subvector frame 28 4)            ; spa: sender protocol address
-            (subvector frame 22 6)            ; sha: sender hardware address
-            (subvector frame 38 4)            ; tpa: target protocol address
-            (subvector frame 32 6)            ; tha: target hardware address
-            (when (> (length frame) +arp-payload-end+)
-              (subvector frame +arp-payload-end+
-                         (- (length frame) +arp-payload-end+))))))
+A VLAN tag sits between the source MAC and the ethertype, pushing everything
+after it out by four bytes, and 802.1ad can stack two. Reading the ethertype at
+a fixed offset makes every tagged frame look like something other than ARP --
+which on a trunk port means seeing nothing whatsoever."
+  (let ((pos 12)
+        (vlan nil))
+    (loop repeat 2
+          while (and (>= (length frame) (+ pos 4))
+                     (let ((et (get-u16-be frame pos)))
+                       (or (= et +ethertype-vlan+) (= et +ethertype-qinq+))))
+          ;; The low 12 bits of the TCI are the VLAN id; the rest is priority
+          ;; and the drop-eligible bit.
+          do (setf vlan (logand #x0fff (get-u16-be frame (+ pos 2)))
+                   pos (+ pos 4)))
+    (when (and (>= (length frame) (+ pos 2))
+               (= (get-u16-be frame pos) +ethertype-arp+))
+      (values (+ pos 2) vlan))))
+
+(defun parse-arp (frame)
+  "Parse any ARP frame, request or reply, tagged or not.
+
+Returns (values op spa sha tpa tha padding vlan), or NIL if FRAME is not ARP.
+PADDING is the Ethernet filler past the ARP payload, or NIL when the capture was
+too short to include any. Callers get the padding because the sending stack
+chooses it and some devices leak buffer contents there."
+  (multiple-value-bind (arp vlan) (arp-offset frame)
+    (when (and arp (>= (length frame) (+ arp +arp-payload-length+)))
+      (let ((end (+ arp +arp-payload-length+)))
+        (values (get-u16-be frame (+ arp 6))    ; op
+                (subvector frame (+ arp 14) 4)  ; spa: sender protocol address
+                (subvector frame (+ arp 8) 6)   ; sha: sender hardware address
+                (subvector frame (+ arp 24) 4)  ; tpa: target protocol address
+                (subvector frame (+ arp 18) 6)  ; tha: target hardware address
+                (when (> (length frame) end)
+                  (subvector frame end (- (length frame) end)))
+                vlan)))))
 
 (defun parse-arp-reply (frame)
   "If FRAME is an ARP reply, return (values sender-ip sender-mac), else NIL."
   (multiple-value-bind (op spa sha) (parse-arp frame)
     (when (and op (= op +arp-op-reply+))
       (values spa sha))))
+
+;;; Wake-on-LAN
+;;;
+;;; A magic packet is six 0xFF bytes followed by the target MAC repeated
+;;; sixteen times. Sent here as a raw Ethernet frame with ethertype 0x0842
+;;; rather than wrapped in UDP: we already have link-layer injection, and this
+;;; way there is no IP stack, no port and no routing involved -- it just has to
+;;; reach the segment.
+
+(defconstant +ethertype-wol+ #x0842)
+
+(defun build-wol-packet (src-mac target-mac)
+  "Build a Wake-on-LAN magic packet frame addressed to TARGET-MAC."
+  (let ((frame (make-array (+ 14 102) :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+    (copy-into frame 0 target-mac)
+    (copy-into frame 6 src-mac)
+    (set-u16-be frame 12 +ethertype-wol+)
+    (loop for i from 14 below 20 do (setf (aref frame i) #xff))
+    (loop for rep from 0 below 16
+          do (copy-into frame (+ 20 (* rep 6)) target-mac))
+    frame))
 
 ;;; MAC address semantics
 ;;;
@@ -193,6 +241,86 @@ addresses and an exhausted heap."
           (if (<= prefix 30)
               (values (1+ net) (1- bcast))
               (values net bcast)))))))
+
+;;; Target sets
+;;;
+;;; A scan is a list of (lo . hi) u32 segments rather than one range, so several
+;;; disjoint pieces of address space can be asked about in one run. Segments are
+;;; merged, which both removes double-sends where the user's specs overlap and
+;;; keeps the walk in address order.
+;;;
+;;; They stay as bounds, never expanded into addresses: the walk is what keeps a
+;;; wide range from allocating (see SEND-PASS).
+
+(defun parse-target (spec)
+  "Parse one target: a CIDR block, an address range, or a single address.
+
+  192.168.1.0/24            a block
+  192.168.1.10-192.168.1.50 a range
+  192.168.1.10-50           the same, abbreviated to the last octet
+  192.168.1.5               one address
+
+Returns (values lo hi)."
+  (let ((spec (string-trim '(#\Space #\Tab) spec)))
+    (when (zerop (length spec))
+      (bad-target spec "empty target"))
+    (cond
+      ((find #\/ spec) (cidr-range spec))
+      ((find #\- spec)
+       (let* ((dash (position #\- spec))
+              (lo-s (subseq spec 0 dash))
+              (hi-s (subseq spec (1+ dash)))
+              (lo (ip->u32 (parse-ip lo-s)))
+              ;; A bare number after the dash is the last octet, so
+              ;; 192.168.1.10-50 does not have to be written out twice.
+              (hi (if (find #\. hi-s)
+                      (ip->u32 (parse-ip hi-s))
+                      (progn
+                        (unless (and (plusp (length hi-s))
+                                     (every #'digit-char-p hi-s))
+                          (bad-target spec "~S is neither an address nor an octet" hi-s))
+                        (let ((n (parse-integer hi-s)))
+                          (unless (<= 0 n 255)
+                            (bad-target spec "octet ~D is out of range 0-255" n))
+                          (logior (logandc2 lo 255) n))))))
+         (when (> lo hi)
+           (bad-target spec "range runs backwards"))
+         (values lo hi)))
+      (t (let ((n (ip->u32 (parse-ip spec))))
+           (values n n))))))
+
+(defun merge-segments (segments)
+  "Sort and coalesce (lo . hi) pairs so nothing is asked twice."
+  (let ((sorted (sort (copy-list segments) #'< :key #'car))
+        (out '()))
+    (dolist (seg sorted (nreverse out))
+      (let ((prev (first out)))
+        ;; 1+ so segments that merely abut are joined too, not just overlaps.
+        (if (and prev (<= (car seg) (1+ (cdr prev))))
+            (setf (cdr prev) (max (cdr prev) (cdr seg)))
+            (push (cons (car seg) (cdr seg)) out))))))
+
+(defun parse-targets (spec)
+  "Parse a comma-separated list of targets into merged segments."
+  (let ((segments '())
+        (start 0))
+    (dotimes (i (1+ (length spec)))
+      (when (or (= i (length spec)) (char= (char spec i) #\,))
+        (let ((piece (string-trim '(#\Space #\Tab) (subseq spec start i))))
+          (unless (zerop (length piece))
+            (multiple-value-bind (lo hi) (parse-target piece)
+              (push (cons lo hi) segments))))
+        (setf start (1+ i))))
+    (unless segments
+      (bad-target spec "no targets"))
+    (merge-segments segments)))
+
+(defun segments-count (segments)
+  (reduce #'+ segments :key (lambda (s) (1+ (- (cdr s) (car s))))))
+
+(defun in-segments-p (segments u32)
+  (loop for (lo . hi) in segments
+          thereis (<= lo u32 hi)))
 
 (defun subnet-range-from-iface (iface)
   "Return (values first-u32 last-u32) for the iface's local subnet."
