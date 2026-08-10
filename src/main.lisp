@@ -161,7 +161,7 @@ hint below sat unreachable for exactly that reason."
   (handler-case (dispatch cmd)
     ;; Bad input is a typo, not a malfunction. 64 is EX_USAGE, matching what
     ;; clingon returns for its own argument errors.
-    ((or usage-error invalid-target) (e)
+    ((or usage-error invalid-target unusable-interface) (e)
       (format *error-output* "~&~A~%See 'arp-scan --help'.~%" e)
       (uiop:quit 64))
     (pcap-error (e)

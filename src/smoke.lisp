@@ -106,6 +106,39 @@ leaves bytes 42.. as the Ethernet padding under test."
               (error "picked a 169.254.x.x address"))
             t)))
 
+      (format t "~%[2b] Interface selection~%")
+      (require! "a nonexistent interface is refused by name"
+        (handler-case (progn (arp-scan::find-iface "definitely-not-an-iface0")
+                             (error "accepted a name that does not exist"))
+          (arp-scan::unusable-interface (e) (format nil "~A" (arp-scan::unusable-interface-reason e)))))
+      (require! "the loopback interface is refused"
+        ;; lo on Linux, lo0 on Darwin/BSD.
+        (let ((lo (find-if #'arp-scan::iface-loopback-p (arp-scan::get-ifaces))))
+          (unless lo (error "no loopback interface on this host"))
+          (handler-case (progn (arp-scan::find-iface (arp-scan::iface-name lo))
+                               (error "accepted loopback"))
+            (arp-scan::unusable-interface () (arp-scan::iface-name lo)))))
+      (require! "an interface with no hardware address is refused, not crashed on"
+        ;; This is what -i utun23 hit: a point-to-point tunnel has an IPv4
+        ;; address but no MAC, and the old code got as far as FORMAT-MAC on NIL.
+        (let ((tunnel (find-if (lambda (i)
+                                 (and (null (arp-scan::iface-mac i))
+                                      (not (arp-scan::iface-loopback-p i))
+                                      (arp-scan::iface-ip i)))
+                               (arp-scan::get-ifaces))))
+          (if tunnel
+              (handler-case
+                  (progn (arp-scan::find-iface (arp-scan::iface-name tunnel))
+                         (error "accepted ~A, which has no MAC"
+                                (arp-scan::iface-name tunnel)))
+                (arp-scan::unusable-interface ()
+                  (format nil "~A refused" (arp-scan::iface-name tunnel))))
+              "no MAC-less interface on this host to test against")))
+      (require! "a usable interface is still accepted"
+        (let ((name (arp-scan::iface-name (arp-scan::default-iface))))
+          (unless (arp-scan::find-iface name) (error "rejected ~A" name))
+          name))
+
       (format t "~%[3] CIDR / subnet math~%")
       (require! "10.0.0.0/30 excludes network + broadcast"
         (multiple-value-bind (a b) (arp-scan::cidr-range "10.0.0.0/30")

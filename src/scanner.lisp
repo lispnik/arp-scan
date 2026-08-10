@@ -26,6 +26,9 @@ at a fixed offset, so it never matches a tagged frame -- on a trunk port the
 plain filter yields nothing at all."
   (format nil "(arp or (vlan and arp)) and not ether src ~A" (format-mac src-mac)))
 
+(defconstant +dlt-en10mb+ 1
+  "libpcap's link type for Ethernet, the only one carrying ARP.")
+
 (defun open-capture (iface)
   "Open the listening handle, filtered and ready for the capture thread."
   (let ((handle (pcap-open-live (iface-name iface)
@@ -33,8 +36,19 @@ plain filter yields nothing at all."
                                 ;; is what lets us keep the trailing padding.
                                 :snaplen 96 :promisc nil :timeout-ms 50)))
     (handler-case
-        (progn (pcap-setfilter handle (capture-filter (iface-mac iface)))
-               handle)
+        (progn
+          ;; FIND-IFACE rejects anything without a hardware address, which
+          ;; catches tunnels already. This asks libpcap directly, so a device
+          ;; that has a MAC but hands us something other than Ethernet frames
+          ;; is caught too, rather than being parsed as though it were.
+          (let ((dlt (%pcap-datalink handle)))
+            (unless (= dlt +dlt-en10mb+)
+              (error 'unusable-interface :name (iface-name iface)
+                     :reason (format nil "libpcap reports link type ~D, not Ethernet (~D), ~
+                                          so frames on it carry no ARP"
+                                     dlt +dlt-en10mb+))))
+          (pcap-setfilter handle (capture-filter (iface-mac iface)))
+          handle)
       (error (e) (%pcap-close handle) (error e)))))
 
 (defun pump (cap obs &optional (seconds 0))

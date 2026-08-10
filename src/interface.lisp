@@ -139,9 +139,44 @@ Prefers non-link-local addresses, then en0."
       (error "No suitable network interface found (need an up, non-loopback iface with IPv4 and MAC)."))
     (first (sort candidates #'> :key #'iface-score))))
 
+(define-condition unusable-interface (error)
+  ((name :initarg :name :reader unusable-interface-name)
+   (reason :initarg :reason :reader unusable-interface-reason))
+  (:report (lambda (c s)
+             (format s "Cannot scan on ~A: ~A.~%Run 'arp-scan -l' to see which interfaces are usable."
+                     (unusable-interface-name c) (unusable-interface-reason c))))
+  (:documentation
+   "Signalled when -i names an interface ARP cannot work on."))
+
 (defun find-iface (name)
-  (or (find name (get-ifaces) :key #'iface-name :test #'string=)
-      (error "Interface ~A not found." name)))
+  "Find the interface called NAME, or explain why it cannot be scanned.
+
+DEFAULT-IFACE has always filtered on USABLE-IFACE-P; this did not, so naming a
+tunnel explicitly got you as far as FORMAT-MAC before failing on a NIL hardware
+address. The checks are ordered most-specific first so the message names the
+actual obstacle rather than the first missing field."
+  (let ((iface (find name (get-ifaces) :key #'iface-name :test #'string=)))
+    (cond
+      ((null iface)
+       (error 'unusable-interface :name name :reason "no such interface"))
+      ((iface-loopback-p iface)
+       (error 'unusable-interface :name name
+              :reason "it is the loopback interface, which has no peers to ask"))
+      ((null (iface-mac iface))
+       ;; Built with FORMAT so the line continuations are processed; a bare
+       ;; string literal would carry the tildes into the slot verbatim.
+       (error 'unusable-interface :name name
+              :reason (format nil "it has no hardware address, so it is not ~
+                                   Ethernet. Point-to-point links such as VPN ~
+                                   and utun tunnels carry no Ethernet header ~
+                                   for an ARP frame to live in")))
+      ((null (iface-ip iface))
+       (error 'unusable-interface :name name :reason "it has no IPv4 address"))
+      ((null (iface-netmask iface))
+       (error 'unusable-interface :name name :reason "it has no IPv4 netmask"))
+      ((not (iface-up-p iface))
+       (error 'unusable-interface :name name :reason "it is down"))
+      (t iface))))
 
 (defun format-ip (bytes)
   (format nil "~D.~D.~D.~D"
@@ -153,10 +188,15 @@ Prefers non-link-local addresses, then en0."
           (aref bytes 3) (aref bytes 4) (aref bytes 5)))
 
 (defun list-interfaces ()
-  "Print all network interfaces and their addresses."
+  "Print all network interfaces and their addresses.
+
+Marks the ones a scan can actually use. Without that the list is a inventory of
+everything the machine has, most of which -- tunnels, loopback, inactive
+adapters -- ARP cannot touch, and there is no way to tell which is which."
   (dolist (i (get-ifaces))
-    (format t "~A~:[~; UP~]~:[~; LOOPBACK~]~%"
-            (iface-name i) (iface-up-p i) (iface-loopback-p i))
+    (format t "~A~:[~; UP~]~:[~; LOOPBACK~]~:[~;  <- scannable~]~%"
+            (iface-name i) (iface-up-p i) (iface-loopback-p i)
+            (usable-iface-p i))
     (when (iface-ip i)
       (format t "    inet ~A  netmask ~A~%"
               (format-ip (iface-ip i))
