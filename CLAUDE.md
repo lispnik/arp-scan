@@ -129,8 +129,13 @@ Layers, bottom-up:
   is held for O(1). Knows nothing about ARP, which is what lets the smoke test
   drive the queue without a handle.
 - **`src/interface.lisp`** — `getifaddrs(3)` walk producing `iface` structs
-  (name, flags, IPv4, netmask, MAC). `default-iface` scores candidates,
-  penalizing link-local addresses and favoring `en0`.
+  (name, flags, IPv4, netmask, MAC). `iface-unusable-reason` is the single
+  definition of "usable": `usable-iface-p`, `find-iface`, `default-iface` and
+  `list-interfaces` all go through it, and its `:needs` argument is how
+  `--wake` and an explicit `-r` ask for less. The link-type test needs an open
+  handle, so it is separate (`check-datalink`); `probe-datalink` lets `-l` and
+  `default-iface` apply it too when running as root. `default-iface` scores
+  candidates, penalizing link-local addresses and favoring `en0`.
 - **`src/arp.lisp`** — pure byte-level code with no I/O: Ethernet+ARP frame
   construction per RFC 826, and IP/CIDR arithmetic on `u32` integers. `parse-arp`
   handles requests and replies alike and hands back the trailing padding;

@@ -74,11 +74,16 @@ keeps a target list something you can maintain in an editor and diff."
   (let ((mac (or (parse-mac mac-string)
                  (error 'usage-error :message
                         (format nil "Not a MAC address: ~S" mac-string))))
-        (iface (if interface (find-iface interface) (default-iface))))
+        ;; Only the MAC is used here: a port with no IPv4 at all is a fine
+        ;; place to send a magic packet from.
+        (iface (if interface (find-iface interface :needs '()) (default-iface))))
     (let ((handle (pcap-open-live (iface-name iface)
                                   :snaplen 96 :promisc nil :timeout-ms 50)))
       (unwind-protect
            (progn
+             ;; A magic packet is an Ethernet frame too; do not push one onto
+             ;; a link that is not.
+             (check-datalink handle (iface-name iface))
              (pcap-sendpacket handle (build-wol-packet (iface-mac iface) mac))
              (format t "~&Magic packet sent to ~A on ~A~%"
                      (format-mac mac) (iface-name iface)))

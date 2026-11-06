@@ -26,9 +26,6 @@ at a fixed offset, so it never matches a tagged frame -- on a trunk port the
 plain filter yields nothing at all."
   (format nil "(arp or (vlan and arp)) and not ether src ~A" (format-mac src-mac)))
 
-(defconstant +dlt-en10mb+ 1
-  "libpcap's link type for Ethernet, the only one carrying ARP.")
-
 (defun open-capture (iface)
   "Open the listening handle, filtered and ready for the capture thread."
   (let ((handle (pcap-open-live (iface-name iface)
@@ -37,16 +34,7 @@ plain filter yields nothing at all."
                                 :snaplen 96 :promisc nil :timeout-ms 50)))
     (handler-case
         (progn
-          ;; FIND-IFACE rejects anything without a hardware address, which
-          ;; catches tunnels already. This asks libpcap directly, so a device
-          ;; that has a MAC but hands us something other than Ethernet frames
-          ;; is caught too, rather than being parsed as though it were.
-          (let ((dlt (%pcap-datalink handle)))
-            (unless (= dlt +dlt-en10mb+)
-              (error 'unusable-interface :name (iface-name iface)
-                     :reason (format nil "libpcap reports link type ~D, not Ethernet (~D), ~
-                                          so frames on it carry no ARP"
-                                     dlt +dlt-en10mb+))))
+          (check-datalink handle (iface-name iface))
           (pcap-setfilter handle (capture-filter (iface-mac iface)))
           handle)
       (error (e) (%pcap-close handle) (error e)))))
@@ -292,6 +280,12 @@ through WATCH-ROUND-DIFF, which is also what suppresses flapping."
                              (hex-string (host-padding host)))))))
              (sleep interval))))
 
+(defun iface-needs (cidr)
+  "What a scan asks of its interface: the netmask only when the range comes
+from it. SCAN-ONCE always reads the IP for the source address, even in passive
+mode, where it is printed."
+  (if cidr '(:ip) '(:ip :netmask)))
+
 (defun scan-hosts (&key interface cidr (per-host-delay-us 1000) (wait-seconds 2)
                         (retry 2) passive fingerprint)
   "Scan and RETURN the HOST records, sorted by IP.  Prints nothing.
@@ -304,7 +298,7 @@ the fingerprint and the timestamps that were all collected anyway.
 
 The observer is made with no callbacks, so nothing streams; PROGRESS goes to a
 broadcast stream with no components, which is the portable bit bucket."
-  (let ((iface (if interface (find-iface interface) (default-iface)))
+  (let ((iface (if interface (find-iface interface :needs (iface-needs cidr)) (default-iface)))
         (obs (make-observer)))
     (scan-once :iface iface :obs obs :cidr cidr :passive passive
                :per-host-delay-us per-host-delay-us
@@ -338,7 +332,7 @@ RTT reports per-host round-trip times.
 FINGERPRINT probes each host with the malformed-frame matrix.
 BASELINE is a known-hosts path to compare against; WRITE-BASELINE one to save to.
 ON-NEW-HOST and ON-ANOMALY are commands to run when those turn up."
-  (let ((iface (if interface (find-iface interface) (default-iface))))
+  (let ((iface (if interface (find-iface interface :needs (iface-needs cidr)) (default-iface))))
     (if watch
         ;; Watch mode is inherently a running commentary, so it always reports
         ;; as text; a single JSON document would never be closed off.

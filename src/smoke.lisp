@@ -107,37 +107,112 @@ leaves bytes 42.. as the Ethernet padding under test."
             t)))
 
       (format t "~%[2b] Interface selection~%")
-      (require! "a nonexistent interface is refused by name"
-        (handler-case (progn (arp-scan::find-iface "definitely-not-an-iface0")
-                             (error "accepted a name that does not exist"))
-          (arp-scan::unusable-interface (e) (format nil "~A" (arp-scan::unusable-interface-reason e)))))
-      (require! "the loopback interface is refused"
-        ;; lo on Linux, lo0 on Darwin/BSD.
-        (let ((lo (find-if #'arp-scan::iface-loopback-p (arp-scan::get-ifaces))))
-          (unless lo (error "no loopback interface on this host"))
-          (handler-case (progn (arp-scan::find-iface (arp-scan::iface-name lo))
-                               (error "accepted loopback"))
-            (arp-scan::unusable-interface () (arp-scan::iface-name lo)))))
-      (require! "an interface with no hardware address is refused, not crashed on"
-        ;; This is what -i utun23 hit: a point-to-point tunnel has an IPv4
-        ;; address but no MAC, and the old code got as far as FORMAT-MAC on NIL.
-        (let ((tunnel (find-if (lambda (i)
-                                 (and (null (arp-scan::iface-mac i))
-                                      (not (arp-scan::iface-loopback-p i))
-                                      (arp-scan::iface-ip i)))
-                               (arp-scan::get-ifaces))))
-          (if tunnel
-              (handler-case
-                  (progn (arp-scan::find-iface (arp-scan::iface-name tunnel))
-                         (error "accepted ~A, which has no MAC"
-                                (arp-scan::iface-name tunnel)))
-                (arp-scan::unusable-interface ()
-                  (format nil "~A refused" (arp-scan::iface-name tunnel))))
-              "no MAC-less interface on this host to test against")))
-      (require! "a usable interface is still accepted"
-        (let ((name (arp-scan::iface-name (arp-scan::default-iface))))
-          (unless (arp-scan::find-iface name) (error "rejected ~A" name))
-          name))
+      ;; Hermetic, unlike [2]: every interface here is a synthetic struct, so
+      ;; each branch of IFACE-UNUSABLE-REASON runs on every host, not just on
+      ;; one that happens to have a tunnel or an unplugged port.
+      (flet ((mk (name &key (up t) (running up) loopback ip netmask mac)
+               (arp-scan::make-iface
+                :name name
+                :flags (logior (if up arp-scan::+iff-up+ 0)
+                               (if running arp-scan::+iff-running+ 0)
+                               (if loopback arp-scan::+iff-loopback+ 0))
+                :ip ip :netmask netmask :mac mac))
+             (reason (iface &rest args)
+               (apply #'arp-scan::iface-unusable-reason iface args)))
+        (let* ((ip (arp-scan::parse-ip "10.0.0.5"))
+               (mask (arp-scan::parse-ip "255.255.255.0"))
+               (mac (make-array 6 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(2 0 0 0 0 1)))
+               (good (mk "eth0" :ip ip :netmask mask :mac mac))
+               (lo (mk "lo0" :loopback t :ip (arp-scan::parse-ip "127.0.0.1")
+                             :netmask (arp-scan::parse-ip "255.0.0.0")))
+               (tunnel (mk "utun3" :ip ip :netmask mask))
+               (down (mk "eth1" :up nil :ip ip :netmask mask :mac mac))
+               ;; The unplugged case: administratively up, no link, no address.
+               (unplugged (mk "eth3" :up t :running nil :mac mac))
+               (noip (mk "eth2" :mac mac))
+               (nomask (mk "tap0" :ip ip :mac mac))
+               (ifaces (list good lo tunnel down unplugged noip nomask)))
+          (require! "a complete, up interface is usable"
+            (let ((r (reason good))) (when r (error "refused: ~A" r)))
+            t)
+          (require! "the loopback interface is refused"
+            (let ((r (reason lo)))
+              (unless (and r (search "loopback" r)) (error "wrong reason: ~A" r))
+              r))
+          (require! "an interface with no hardware address is refused, not crashed on"
+            ;; This is what -i utun23 hit: a point-to-point tunnel has an IPv4
+            ;; address but no MAC, and the old code got as far as FORMAT-MAC on NIL.
+            (let ((r (reason tunnel)))
+              (unless (and r (search "hardware address" r)) (error "wrong reason: ~A" r))
+              "refused"))
+          (require! "a down interface is refused"
+            (let ((r (reason down)))
+              (unless (equal r "it is down") (error "wrong reason: ~A" r))
+              r))
+          (require! "an unplugged port is reported as no carrier, not as missing an address"
+            (let ((r (reason unplugged)))
+              (unless (and r (search "no carrier" r)) (error "wrong reason: ~A" r))
+              r))
+          (require! "an interface with no IPv4 address is refused for a scan"
+            (let ((r (reason noip)))
+              (unless (equal r "it has no IPv4 address") (error "wrong reason: ~A" r))
+              r))
+          (require! "the netmask is demanded only when the range comes from the interface"
+            (unless (equal (reason nomask) "it has no IPv4 netmask")
+              (error "no netmask accepted: ~A" (reason nomask)))
+            (let ((r (reason nomask :needs '(:ip))))
+              (when r (error "refused with an explicit range: ~A" r)))
+            "needed without -r, not with")
+          (require! "--wake needs only a MAC and a live link"
+            (let ((r (reason noip :needs '())))
+              (when r (error "an IPv4-less port was refused: ~A" r)))
+            (unless (reason tunnel :needs '())
+              (error "relaxing :needs waived the hardware-address check"))
+            (unless (and (reason down :needs '()) (reason unplugged :needs '()))
+              (error "relaxing :needs waived the link check"))
+            t)
+          (require! "usable-iface-p agrees with iface-unusable-reason"
+            (unless (arp-scan::usable-iface-p good) (error "good refused"))
+            (let ((wrong (remove-if-not #'arp-scan::usable-iface-p (rest ifaces))))
+              (when wrong (error "accepted ~{~A~^, ~}" (mapcar #'arp-scan::iface-name wrong))))
+            t)
+          (require! "find-iface returns the usable interface"
+            (unless (eq good (arp-scan::find-iface "eth0" :ifaces ifaces))
+              (error "did not return eth0"))
+            "eth0")
+          (require! "find-iface signals with the same reason"
+            (handler-case
+                (progn (arp-scan::find-iface "utun3" :ifaces ifaces)
+                       (error "accepted utun3"))
+              (arp-scan::unusable-interface (e)
+                (unless (equal (arp-scan::unusable-interface-reason e) (reason tunnel))
+                  (error "reasons differ"))
+                (arp-scan::unusable-interface-name e))))
+          (require! "a nonexistent interface is refused by name"
+            (handler-case (progn (arp-scan::find-iface "definitely-not-an-iface0" :ifaces ifaces)
+                                 (error "accepted a name that does not exist"))
+              (arp-scan::unusable-interface (e) (arp-scan::unusable-interface-reason e))))
+          (require! "unusable-interface is part of the library API"
+            ;; A caller of SCAN-HOSTS handles it by name, through the package,
+            ;; not via arp-scan:: -- so the symbol and its readers are exported.
+            (dolist (sym '("UNUSABLE-INTERFACE" "UNUSABLE-INTERFACE-NAME"
+                           "UNUSABLE-INTERFACE-REASON"))
+              (multiple-value-bind (s status) (find-symbol sym :arp-scan)
+                (unless (and s (eq status :external))
+                  (error "~A is ~A" sym (or status "missing")))))
+            t)
+          (require! "iface-needs drops the netmask only for an explicit range"
+            (unless (and (equal (arp-scan::iface-needs "10.0.0.0/24") '(:ip))
+                         (equal (arp-scan::iface-needs nil) '(:ip :netmask)))
+              (error "wrong needs"))
+            t)
+          (require! "a non-Ethernet link type is refused; Ethernet is not"
+            (when (arp-scan::datalink-unusable-reason arp-scan::+dlt-en10mb+)
+              (error "refused DLT_EN10MB"))
+            (let ((r (arp-scan::datalink-unusable-reason 12)))
+              (unless (and r (search "link type 12" r)) (error "accepted DLT 12: ~A" r))
+              r))))
 
       (format t "~%[3] CIDR / subnet math~%")
       (require! "10.0.0.0/30 excludes network + broadcast"

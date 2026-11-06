@@ -10,6 +10,10 @@
            ;; vendor, rtt, fingerprint and timestamps that were collected
            ;; anyway.  plumb/arp is the first consumer.
            #:scan-hosts
+           ;; What SCAN-HOSTS can signal about its interface, so a caller can
+           ;; tell "bad -i" from a permissions failure without arp-scan::.
+           #:unusable-interface
+           #:unusable-interface-name #:unusable-interface-reason
            #:host #:host-p
            #:host-ip #:host-mac #:host-vendor #:host-kind #:host-rtt
            #:host-fingerprint #:host-first-seen #:host-last-seen
